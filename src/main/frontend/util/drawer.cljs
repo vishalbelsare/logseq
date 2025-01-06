@@ -1,7 +1,8 @@
-(ns frontend.util.drawer
+(ns ^:no-doc frontend.util.drawer
   (:require [clojure.string :as string]
             [frontend.util :as util]
-            [frontend.util.property :as property]
+            [logseq.graph-parser.mldoc :as gp-mldoc]
+            [logseq.graph-parser.property :as gp-property]
             [frontend.format.mldoc :as mldoc]))
 
 (defn drawer-start
@@ -22,7 +23,7 @@
 
 (defn get-drawer-ast
   [format content typ]
-  (let [ast (mldoc/->edn content (mldoc/default-config format))
+  (let [ast (mldoc/->edn content (gp-mldoc/default-config format))
         typ-drawer (ffirst (filter (fn [x]
                                      (mldoc/typ-drawer? x typ)) ast))]
     typ-drawer))
@@ -31,7 +32,7 @@
   [format content typ value]
   (when (string? content)
     (try
-      (let [ast (mldoc/->edn content (mldoc/default-config format))
+      (let [ast (mldoc/->edn content (gp-mldoc/default-config format))
             has-properties? (some (fn [x] (mldoc/properties? x)) ast)
             has-typ-drawer? (some (fn [x] (mldoc/typ-drawer? x typ)) ast)
             lines (string/split-lines content)
@@ -53,16 +54,16 @@
                         (if has-properties?
                           (cond
                             (= :org format)
-                            (let [prop-start-idx (.indexOf body-without-timestamps property/properties-start)
-                                  prop-end-idx (.indexOf body-without-timestamps property/properties-end)
+                            (let [prop-start-idx (.indexOf body-without-timestamps gp-property/properties-start)
+                                  prop-end-idx (.indexOf body-without-timestamps gp-property/properties-end)
                                   properties (subvec body-without-timestamps prop-start-idx (inc prop-end-idx))
                                   after (subvec body-without-timestamps (inc prop-end-idx))]
                               (string/join "\n" (concat [title] scheduled deadline properties [drawer] after)))
 
                             :else
                             (let [properties-count (count (second (first (second ast))))
-                                  properties (subvec body-without-timestamps 0 (inc properties-count))
-                                  after (rest body-without-timestamps)]
+                                  properties (subvec body-without-timestamps 0 properties-count)
+                                  after (subvec body-without-timestamps properties-count)]
                               (string/join "\n" (concat [title] scheduled deadline properties [drawer] after))))
                           (string/join "\n" (concat [title] scheduled deadline [drawer] body-without-timestamps))))
 
@@ -76,11 +77,11 @@
                             lines (concat [title] scheduled deadline before
                                           [(drawer-start typ)] middle [drawer-end] after)]
                         (string/join "\n" lines))
-                      
+
                       :else
                       content)]
         (string/trimr result))
-      (catch js/Error e
+      (catch :default e
         (js/console.error e)
         content))))
 
@@ -92,27 +93,28 @@
 ;; TODO: DRY
 (defn remove-logbook
   [content]
-  (if (contains-logbook? content)
-    (let [lines (string/split-lines content)
-          [title-lines body] (split-with (fn [l]
-                                           (not (string/starts-with? (string/upper-case (string/triml l)) ":LOGBOOK:")))
-                                         lines)
-          body (drop-while (fn [l]
-                             (let [l' (string/lower-case (string/trim l))]
-                               (or
-                                (not (string/starts-with? l' ":end:"))
-                                (string/blank? l))))
-                           body)
-          body (if (and (seq body)
-                        (string/starts-with? (string/lower-case (string/triml (first body))) ":end:"))
-                 (let [line (string/replace (first body) #"(?i):end:\s?" "")]
-                   (if (string/blank? line)
-                     (rest body)
-                     (cons line (rest body))))
-                 body)]
-      (->> (concat title-lines body)
-           (string/join "\n")))
-    content))
+  (when content
+    (if (contains-logbook? content)
+      (let [lines (string/split-lines content)
+            [title-lines body] (split-with (fn [l]
+                                             (not (string/starts-with? (string/upper-case (string/triml l)) ":LOGBOOK:")))
+                                           lines)
+            body (drop-while (fn [l]
+                               (let [l' (string/lower-case (string/trim l))]
+                                 (or
+                                  (not (string/starts-with? l' ":end:"))
+                                  (string/blank? l))))
+                             body)
+            body (if (and (seq body)
+                          (string/starts-with? (string/lower-case (string/triml (first body))) ":end:"))
+                   (let [line (string/replace (first body) #"(?i):end:\s?" "")]
+                     (if (string/blank? line)
+                       (rest body)
+                       (cons line (rest body))))
+                   body)]
+        (->> (concat title-lines body)
+             (string/join "\n")))
+      content)))
 
 (defn get-logbook
   [body]

@@ -1,13 +1,18 @@
 (ns frontend.db-mixins
-  (:require [frontend.db.react :as db]))
+  "Rum mixins that depend on db"
+  (:require [frontend.db.react :as react]))
 
 (def query
-  {:wrap-render
+  {:init
+   (fn [state]
+     (assoc state :reactive-queries (atom #{})))
+   :wrap-render
    (fn [render-fn]
      (fn [state]
-       (binding [db/*query-component* (:rum/react-component state)]
+       (binding [react/*query-component* (:rum/react-component state)
+                 react/*reactive-queries* (:reactive-queries state)]
          (render-fn state))))
    :will-unmount
    (fn [state]
-     (db/remove-query-component! (:rum/react-component state))
+     (react/remove-query-component! (:rum/react-component state))
      state)})

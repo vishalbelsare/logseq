@@ -1,19 +1,13 @@
-#mobile-editor-toolbar {
+#audio-record-toolbar {
   position: fixed;
-  bottom: 0;
-  width: 100%;
-  left: 0;
-  justify-content: center;
-  height: 2.5rem;
-  display: flex;
-  align-items: center;
+  background-color: var(--ls-secondary-background-color);
+  width: 90px;
+  justify-content: left;
+  left: 5px;
+  transition: none;
   z-index: 9999;
-
-  transition: top 0.3s;
-
-  button {
-    padding: 10px;
-  }
+  padding: 5px 5px 5px 8px;
+  border-radius: 5px;
 }
 
 .editor-wrapper {
@@ -31,6 +25,7 @@
     background: transparent;
     padding: 0;
     resize: none;
+    box-shadow: none;
   }
 }
 
@@ -40,6 +35,30 @@
 
   &.is-overflow-vw-x {
     transform: translateX(calc(-100% + 1rem));
+  }
+
+  &.is-overflow-vh-y {
+    transform: translateY(calc(-100% - 2rem));
+  }
+
+  &[data-modal-name] {
+    @apply bg-popover border overflow-x-hidden overflow-y-auto rounded-lg py-1;
+  }
+
+  &[data-modal-name="commands"],
+  &[data-modal-name="select-code-block-mode"] {
+    @screen sm {
+      width: 380px !important;
+      max-width: 90vw !important;
+    }
+  }
+
+  &[data-modal-name="date-picker"] {
+    @apply py-0;
+
+    .rc-datepicker {
+      @apply my-0;
+    }
   }
 }
 
@@ -68,3 +87,14 @@ pre {
 .preview-trigger-wrapper > [data-tooltipped] {
   display: block !important;
 }
+
+#time-repeater {
+  min-width: 300px;
+
+  @screen sm {
+    width: 135px;
+  }
+}
+
+
+

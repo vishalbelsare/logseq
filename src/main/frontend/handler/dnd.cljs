@@ -1,75 +1,58 @@
 (ns frontend.handler.dnd
-  (:require [frontend.db :as db]
-            [frontend.handler.editor :as editor-handler]
+  "Provides fns for drag and drop"
+  (:require [frontend.handler.editor :as editor-handler]
+            [frontend.handler.editor.property :as editor-property]
             [frontend.modules.outliner.core :as outliner-core]
             [frontend.modules.outliner.tree :as tree]
-            [frontend.state :as state]
-            [frontend.util :as util]))
+            [frontend.modules.outliner.transaction :as outliner-tx]
+            [logseq.graph-parser.util.block-ref :as block-ref]
+            [frontend.state :as state]))
 
-
-(defn- moveable?
-  [current-block target-block]
-  (let [current-block-uuid (:block/uuid current-block)]
-    (or
-     (not= (:block/page current-block) (:block/page target-block))
-     (and
-      (not= current-block-uuid (:block/uuid target-block))
-      (loop [loc target-block]
-        (if-let [parent (db/pull (:db/id (:block/parent loc)))]
-          (if (= (:block/uuid parent) current-block-uuid)
-            false
-            (recur parent))
-          true))))))
-
-(defn move-block
-  "There can be two possible situations:
-  1. Move a block in the same file (either top-to-bottom or bottom-to-top).
-  2. Move a block between two different files.
-
-  Notes:
-  1. Those two blocks might have different formats, e.g. one is `org` and another is `markdown`,
-     we don't handle this now. TODO: transform between different formats in mldoc.
-  2. Sometimes we might need to move a parent block to it's own child.
-  "
-  [^js event current-block target-block move-to]
-  (let [top? (= move-to :top)
+(defn move-blocks
+  [^js event blocks target-block move-to]
+  (let [blocks' (map #(dissoc % :block/level :block/children) blocks)
+        first-block (first blocks')
+        top? (= move-to :top)
         nested? (= move-to :nested)
         alt-key? (and event (.-altKey event))
-        repo (state/get-current-repo)]
+        current-format (:block/format first-block)
+        target-format (:block/format target-block)]
     (cond
-      alt-key?
+      ;; alt pressed, make a block-ref
+      (and alt-key? (= (count blocks) 1))
       (do
-        (editor-handler/set-block-property! (:block/uuid current-block)
+        (editor-property/set-block-property! (:block/uuid first-block)
                                             :id
-                                            (str (:block/uuid current-block)))
+                                            (str (:block/uuid first-block)))
         (editor-handler/api-insert-new-block!
-         (util/format "((%s))" (str (:block/uuid current-block)))
+         (block-ref/->block-ref (:block/uuid first-block))
          {:block-uuid (:block/uuid target-block)
           :sibling? (not nested?)
-          :before? top?})
-        (db/refresh! repo {:key :block/change
-                           :data [current-block target-block]}))
+          :before? top?}))
 
-      (and (every? map? [current-block target-block])
-           (moveable? current-block target-block))
-      (let [[current-node target-node]
-            (mapv outliner-core/block [current-block target-block])]
-        (cond
-          top?
-          (let [first-child?
-                (= (tree/-get-parent-id target-node)
-                   (tree/-get-left-id target-node))]
-            (if first-child?
-              (let [parent (tree/-get-parent target-node)]
-                (outliner-core/move-subtree current-node parent false))
-              (outliner-core/move-subtree current-node target-node true)))
-          nested?
-          (outliner-core/move-subtree current-node target-node false)
+      ;; format mismatch
+      (and current-format target-format (not= current-format target-format))
+      (state/pub-event! [:notification/show
+                         {:content [:div "Those two pages have different formats."]
+                          :status :warning
+                          :clear? true}])
 
-          :else
-          (outliner-core/move-subtree current-node target-node true))
-        (db/refresh! repo {:key :block/change
-                           :data [(:data current-node) (:data target-node)]}))
+
+      (every? map? (conj blocks target-block))
+      (let [target-node (outliner-core/block target-block)]
+        (outliner-tx/transact!
+          {:outliner-op :move-blocks}
+          (editor-handler/save-current-block!)
+          (if top?
+            (let [first-child?
+                  (= (tree/-get-parent-id target-node)
+                     (tree/-get-left-id target-node))]
+              (if first-child?
+                (let [parent (tree/-get-parent target-node)]
+                  (outliner-core/move-blocks! blocks (:data parent) false))
+                (let [before-node (tree/-get-left target-node)]
+                  (outliner-core/move-blocks! blocks (:data before-node) true))))
+            (outliner-core/move-blocks! blocks target-block (not nested?)))))
 
       :else
       nil)))

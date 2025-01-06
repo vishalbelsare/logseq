@@ -1,42 +1,29 @@
 (ns frontend.format
+  "Main ns for providing common operations on file content like conversion to html
+and edn. Can handle org-mode and markdown formats"
   (:require [frontend.format.mldoc :refer [->MldocMode] :as mldoc]
-            [frontend.format.adoc :refer [->AdocMode]]
             [frontend.format.protocol :as protocol]
+            [logseq.graph-parser.mldoc :as gp-mldoc]
+            [logseq.graph-parser.util :as gp-util]
             [clojure.string :as string]))
 
 (defonce mldoc-record (->MldocMode))
-(defonce adoc-record (->AdocMode))
-
-(defn normalize
-  [format]
-  (case (keyword format)
-    :md :markdown
-    :asciidoc :adoc
-    ;; default
-    (keyword format)))
-
-(defn get-format
-  [file]
-  (when file
-    (normalize (keyword (string/lower-case (last (string/split file #"\.")))))))
 
 (defn get-format-record
   [format]
-  (case (normalize format)
+  (case (gp-util/normalize-format format)
     :org
     mldoc-record
     :markdown
     mldoc-record
-    :adoc
-    adoc-record
     nil))
 
 ;; html
 (defn get-default-config
   ([format]
-   (mldoc/default-config format))
+   (gp-mldoc/default-config format))
   ([format options]
-   (mldoc/default-config format options)))
+   (gp-mldoc/default-config format options)))
 
 (defn to-html
   ([content format]
@@ -46,7 +33,7 @@
      (if (string/blank? content)
        ""
        (if-let [record (get-format-record format)]
-         (protocol/toHtml record content config mldoc/default-references)
+         (protocol/toHtml record content config gp-mldoc/default-references)
          content)))))
 
 (defn to-edn
@@ -57,8 +44,3 @@
      (if-let [record (get-format-record format)]
        (protocol/toEdn record content config)
        nil))))
-
-(defn loaded?
-  [format]
-  (when-let [record (get-format-record format)]
-    (protocol/loaded? record)))

@@ -24,7 +24,7 @@ For other tasks like bundling static resources and building the desktop app, whi
 
 [React](https://reactjs.org/) is a library for building data-driven UI declaratively. Comparing to the imperative ways (such as DOM manipulation or using jQuery), it's simpler and easier to code correctly.
 
-[Rum](https://github.com/tonsky/rum) is a React wrapper in ClojureScript. More than just providing the familiar React APIs, Rum adds many Clojure flavors to React, especially on the state management part. As a result, if you have experience with React, read Rum's [README]((https://github.com/tonsky/rum) before diving into the code.
+[Rum](https://github.com/tonsky/rum) is a React wrapper in ClojureScript. More than just providing the familiar React APIs, Rum adds many Clojure flavors to React, especially on the state management part. As a result, if you have experience with React, read Rum's [README](https://github.com/tonsky/rum) before diving into the code.
 
 ### DataScript
 
@@ -36,15 +36,23 @@ After cloning the [Logseq repository](https://github.com/logseq/logseq), there a
 
 - Config files are located at the root directory. `package.json` contains the JavaScript dependencies while `deps.edn` contains their Clojure counterparts. `shadow-cljs.edn` and `gulpfile.js` contain all the build scripts.
 
-- `/public` and `/resources` contain all the static assets
+- `public/` and `resources/` contain all the static assets
 
-- `/src` is where most of the code locates.
+- `src/` is where most of the code is located.
 
-  - `/src/electron` and `/src/main/electron` contains code specific to the desktop app.
+  - `src/electron/` and `src/main/electron/` contains code specific to the desktop app.
 
-  - `/src/test` contains all the test and `/src/dev-cljs` contains some development utilities.
+  - `src/test/` contains all the tests and `src/dev-cljs/` contains some development utilities.
 
-  - `/src/main/frontend` contains code that powers the Logseq editor. Folders and files inside are organized by features or functions. For example, `components` contains all the UI components and `handler` contains all the event-handling code. You can explore on your own interest.
+  - `src/resources/` - directory and classpath for resources used by Clojure(Script)
+
+  - `src/main/frontend/` contains code that powers the Logseq editor. Folders and files inside are organized by features or functions. For example, `components` contains all the UI components and `handler` contains all the event-handling code. You can explore on your own interest.
+
+  - `src/main/logseq/` contains the api used by plugins.
+
+- `deps/` contains dependencies or libraries used by the frontend.
+
+  - `deps/graph-parser/` is a library that parses a Logseq graph and saves it to a database.
 
 ## Data Flow
 
@@ -68,4 +76,4 @@ After the change changes, React will dutifully refresh the screen.
 
 ## Architecture
 
-Logseq has undergone a heavy refactoring, results in a much more robust and clear architecture. Read [this article](https://logseq.github.io/#/page/The%20Refactoring%20Of%20Logseq) written by the main contributor to the refactoring for a detailed tour.
+Logseq has undergone a heavy refactoring, results in a much more robust and clear architecture. Read [this article](https://docs.logseq.com/#/page/The%20Refactoring%20Of%20Logseq) written by the main contributor to the refactoring for a detailed tour.

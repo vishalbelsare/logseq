@@ -1,3 +1,4 @@
+/e2e-dump
 /target
 /classes
 /checkouts
@@ -10,9 +11,13 @@ pom.xml.asc
 /.nrepl-port
 .hgignore
 .hg/
+.nbb/
 
 node_modules/
-static/
+static/**
+!static/yarn.lock
+tmp
+cljs-test-runner-out
 
 .cpcache/
 /src/gen
@@ -29,11 +34,32 @@ strings.csv
 
 .calva
 resources/electron.js
-.clj-kondo/
-.lsp/
+.lsp/.cache
+.clj-kondo/.cache
+.clj-kondo/babashka/sci
 /libs/dist/
 charlie/
 .vscode
 /.preprocessor-cljs
 docker
-yarn.lock
+android/app/src/main/assets/capacitor.plugin.json
+ios/App/App/capacitor.config.json
+
+startup.png
+
+/src/main/frontend/tldraw-logseq.js
+/src/test/docs*
+~*~
+
+android/app/src/main/assets/capacitor.config.json
+
+*.sublime-*
+/public/static
+.yarn/
+.yarnrc.yml
+
+packages/ui/.storybook/cljs
+deps/shui/.lsp
+deps/shui/.lsp-cache
+deps/shui/.clj-kondo
+deps/shui/shui-graph/logseq/bak

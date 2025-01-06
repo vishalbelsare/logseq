@@ -1,4 +1,5 @@
 (ns frontend.util.clock
+  "Provides clock related functionality used by tasks"
   (:require [frontend.state :as state]
             [frontend.util.drawer :as drawer]
             [frontend.util :as util]
@@ -20,19 +21,30 @@
         seconds (mod seconds 60)]
     (util/format "%02d:%02d:%02d" hours minutes seconds)))
 
-(defn minutes->days:hours:minutes
-  [minutes]
-  (let [days (quot (quot minutes 60) 24)
-        hours (quot (- minutes (* days 60 24)) 60)
-        minutes (mod minutes 60)]
-    (util/format "%s%s%s"
+(defn s->dhms-util
+  "A function that returns the values for easier testing. 
+   Always in the order [days, hours, minutes, seconds]"
+  [seconds]
+  (let [days (quot (quot seconds 3600) 24)
+        n (mod seconds (* 24 3600))
+        hours (quot n 3600)
+        n (mod n 3600)
+        minutes (quot n 60)
+        secs (mod n 60)]
+    [days hours minutes secs]))
+
+(defn seconds->days:hours:minutes:seconds
+  [seconds]
+  (let [[days hours minutes seconds] (s->dhms-util seconds)]
+    (util/format "%s%s%s%s"
                  (if (zero? days) "" (str days "d"))
                  (if (zero? hours) "" (str hours "h"))
-                 (if (zero? minutes) "" (str minutes "m")))))
+                 (if (zero? minutes) "" (str minutes "m"))
+                 (if (zero? seconds) "" (str seconds "s")))))
 
 (def support-seconds?
-  (get (state/get-config)
-       [:logbook/settings :with-second-support?] true))
+  (get-in (state/get-config)
+          [:logbook/settings :with-second-support?] true))
 
 (defn- now []
   (if support-seconds?
@@ -77,38 +89,29 @@
               (str clock-in-log "\n")
               (str clock-out-log "\n"))))))
      content)
-    (catch js/Error e
+    (catch :default _e
       content)))
 
 (defn clock-summary
   [body string?]
   (when-let [logbook (drawer/get-logbook body)]
     (when-let [logbook-lines (last logbook)]
-      (when-let [clock-lines (filter #(string/starts-with? % "CLOCK:") logbook-lines)]
-        (let [times (map #(string/trim (last (string/split % "=>"))) clock-lines)
-              hours-coll (map #(int (first (string/split % ":"))) times)
-              minutes-coll (map #(int (second (string/split % ":"))) times)
-              seconds-coll (map #(int (nth (string/split % ":") 2 0)) times)
-              reduced-seconds (reduce + seconds-coll)
-              reduced-minutes (reduce + minutes-coll)
-              reduced-hours (reduce + hours-coll)
-              seconds (mod reduced-seconds 60)
-              minutes (mod (+ reduced-minutes (quot reduced-seconds 60)) 60)
-              hours (+ reduced-hours
-                       (quot reduced-minutes 60)
-                       (quot (+ (mod reduced-minutes 60) reduced-seconds) 3600))]
+      (when-let [clock-lines (seq (filter #(string/starts-with? % "CLOCK:") logbook-lines))]
+        (let [[hours minutes seconds] (apply map + (->> clock-lines
+                                                        (map #(string/split (string/trim (last (string/split % "=>"))) ":"))
+                                                        (map #(map int %))))
+              duration (t/period :hours hours
+                                 :minutes minutes
+                                 :seconds seconds)
+              duration-in-minutes (t/in-minutes duration)
+              zero-minutes? (zero? duration-in-minutes)]
           (if string?
-            (util/format "%s%s%s"
-                         (if (>= hours 1)
-                           (when hours (str hours "h"))
-                           "")
-                         (if (zero? minutes)
-                           ""
-                           (str minutes "m"))
-                         (if (zero? seconds)
-                           ""
-                           (str seconds "s")))
-            (let [minutes (+ (* hours 60) minutes)]
-              (if (zero? minutes)
-                seconds
-                minutes))))))))
+            (if zero-minutes?
+              (str seconds "s")
+              (-> (tf/unparse-duration duration)
+                  (string/replace #"\s+days?\s+" "d")
+                  (string/replace #"\s+hours?\s+" "h")
+                  (string/replace #"\s+minutes?$" "m")))
+            (if zero-minutes?
+              seconds
+              (* 60 duration-in-minutes))))))))

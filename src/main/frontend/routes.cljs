@@ -1,16 +1,19 @@
 (ns frontend.routes
-  (:require [frontend.components.home :as home]
-            [frontend.components.repo :as repo]
-            [frontend.components.file :as file]
-            [frontend.components.page :as page]
-            [frontend.components.diff :as diff]
-            [frontend.components.plugins :as plugins]
+  "Defines routes for use with reitit router"
+  (:require [frontend.components.file :as file]
+            [frontend.components.home :as home]
             [frontend.components.journal :as journal]
-            [frontend.components.search :as search]
+            [frontend.components.onboarding.setups :as setups]
+            [frontend.components.page :as page]
+            [frontend.components.plugins :as plugins]
+            [frontend.components.repo :as repo]
             [frontend.components.settings :as settings]
-            [frontend.components.external :as external]
-            [frontend.components.shortcut :as shortcut]
-            [frontend.extensions.zotero :as zotero]))
+            [frontend.components.whiteboard :as whiteboard]
+            [frontend.extensions.zotero :as zotero]
+            [frontend.components.bug-report :as bug-report]
+            [frontend.components.user.login :as login]
+            [logseq.shui.demo :as shui]
+            ))
 
 ;; http://localhost:3000/#?anchor=fn.1
 (def routes
@@ -22,9 +25,17 @@
     {:name :repos
      :view repo/repos}]
 
+   ["/whiteboard/:name"
+    {:name :whiteboard
+     :view whiteboard/whiteboard-route}]
+
+   ["/whiteboards"
+    {:name :whiteboards
+     :view whiteboard/whiteboard-dashboard}]
+
    ["/repo/add"
     {:name :repo-add
-     :view repo/add-repo}]
+     :view setups/picker}]
 
    ["/all-files"
     {:name :all-files
@@ -34,12 +45,12 @@
     {:name :file
      :view file/file}]
 
-   ["/search/:q"
-    {:name :search
-     :view search/more}]
-
    ["/page/:name"
     {:name :page
+     :view page/page}]
+
+   ["/page/:name/block/:block-route-name"
+    {:name :page-block
      :view page/page}]
 
    ["/all-pages"
@@ -50,17 +61,9 @@
     {:name :graph
      :view page/global-graph}]
 
-   ["/diff"
-    {:name :diff
-     :view diff/diff}]
-
    ["/settings"
     {:name :settings
      :view settings/settings}]
-
-   ["/settings/shortcut"
-    {:name :shortcut-setting
-     :view shortcut/shortcut}]
 
    ["/settings/zotero"
     {:name :zotero-setting
@@ -68,7 +71,15 @@
 
    ["/import"
     {:name :import
-     :view external/import-cp}]
+     :view setups/importer}]
+
+   ["/bug-report"
+    {:name :bug-report
+     :view bug-report/bug-report}]
+
+    ["/bug-report-tool/:tool"
+     {:name :bug-report-tools
+      :view bug-report/bug-report-tool-route}]
 
    ["/all-journals"
     {:name :all-journals
@@ -76,4 +87,13 @@
 
    ["/plugins"
     {:name :plugins
-     :view plugins/plugins-page}]])
+     :view plugins/plugins-page}]
+
+   ["/login"
+    {:name :user-login
+     :view login/page}]
+
+   ["/ui"
+    {:name :ui
+     :view shui/page}]
+   ])

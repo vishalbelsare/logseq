@@ -1,0 +1,14 @@
+{
+  "name": "@logseq/graph-parser",
+  "version": "1.0.0",
+  "private": true,
+  "devDependencies": {
+    "@logseq/nbb-logseq": "^1.2.173"
+  },
+  "dependencies": {
+    "mldoc": "^1.5.1"
+  },
+  "scripts": {
+    "test": "nbb-logseq -cp test -m nextjournal.test-runner"
+  }
+}

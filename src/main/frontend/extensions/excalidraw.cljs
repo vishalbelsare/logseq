@@ -1,8 +1,11 @@
 (ns frontend.extensions.excalidraw
-  (:require ["@excalidraw/excalidraw" :as Excalidraw]
-            [cljs-bean.core :as bean]
-            [clojure.string :as string]
+  (:require [clojure.string :as string]
+            ;; NOTE: Always use production build of excalidraw
+            ;; See-also: https://github.com/excalidraw/excalidraw/pull/3330
+            ["@excalidraw/excalidraw/dist/excalidraw.production.min" :refer [Excalidraw serializeAsJSON]]
             [frontend.config :as config]
+            [frontend.db :as db]
+            [frontend.handler.editor :as editor-handler]
             [frontend.handler.draw :as draw]
             [frontend.handler.notification :as notification]
             [frontend.handler.ui :as ui-handler]
@@ -11,55 +14,74 @@
             [frontend.ui :as ui]
             [frontend.util :as util]
             [goog.object :as gobj]
-            [rum.core :as rum]))
+            [goog.functions :refer [debounce]]
+            [rum.core :as rum]
+            [frontend.mobile.util :as mobile-util]))
 
-(def excalidraw (r/adapt-class (gobj/get Excalidraw "default")))
+(def excalidraw (r/adapt-class Excalidraw))
 
 (defn from-json
   [text]
   (when-not (string/blank? text)
     (try
       (js/JSON.parse text)
-      (catch js/Error e
+      (catch :default e
         (println "from json error:")
         (js/console.dir e)
         (notification/show!
          (util/format "Could not load this invalid excalidraw file")
          :error)))))
 
-(defonce *bounding-width (atom nil))
-(defn- get-bounding-width
-  [ref]
-  (when ref
-    (when-let [current (gobj/get ref "current")]
-      (-> current
-         (.getBoundingClientRect)
-         (gobj/get "width")))))
-
 (defn- update-draw-content-width
   [state]
-  (let [el ^js (rum/dom-node state)
-        el (and el (.querySelector el ".draw-wrap"))
-        width (and el (.-clientWidth el))]
-    (reset! (::draw-width state) width)
+  (when-let [el ^js (rum/dom-node state)]
+    (loop [el (.querySelector el ".draw-wrap")]
+      (cond
+        (or (nil? el) (undefined? el) (undefined? (.-classList el)))
+        nil
+
+        (..  el -classList (contains "block-content"))
+        (let [client-width (.-clientWidth el)
+              width (if (zero? client-width)
+                      (.-width (.-getBoundingClientRect el))
+                      client-width)]
+          (reset! (::draw-width state) width))
+
+        :else
+        (recur (.-parentNode el))))
     state))
+
+(defn excalidraw-theme [ui-theme]
+  ;; One of these constants are meant to be used as a 'theme' argument for escalidraw:
+  ;; https://github.com/excalidraw/excalidraw/blob/master/src/constants.ts#L75
+  ;; But they are missing from the prod build of excalidraw we're using.
+  ;; They map to "light" and "dark", happens that :ui/theme uses same values, so we are safe to pass it directly, for now.
+  ;; Escalidraw may migrate to different values for these constants in future versions,
+  ;; so, in order to not watch out for it every time we bump a new version we better migrate to constants as soon as they appear in a prod build.
+  ui-theme)
 
 (rum/defcs draw-inner < rum/reactive
   (rum/local 800 ::draw-width)
   (rum/local true ::zen-mode?)
   (rum/local false ::view-mode?)
+  (rum/local false ::grid-mode?)
   (rum/local nil ::elements)
-  {:did-mount update-draw-content-width}
-  {:did-update update-draw-content-width}
+  (rum/local nil ::resize-observer)
+  {:did-mount (fn [state]
+                (reset! (::resize-observer state) (js/ResizeObserver. (debounce #(reset! (::draw-width state) 0) 300)))
+                (.observe @(::resize-observer state) (ui/main-node))
+                (update-draw-content-width state))
+   :did-update update-draw-content-width
+   :will-unmount (fn [state] (.disconnect @(::resize-observer state)))}
   [state data option]
-  (let [current-repo (state/sub :git/current-repo)
-        bounding-width (rum/react *bounding-width)
+  (let [ref (rum/create-ref)
         *draw-width (get state ::draw-width)
         *zen-mode? (get state ::zen-mode?)
         *view-mode? (get state ::view-mode?)
+        *grid-mode? (get state ::grid-mode?)
         wide-mode? (state/sub :ui/wide-mode?)
         *elements (get state ::elements)
-        file (:file option)]
+        {:keys [file block-uuid]} option]
     (when data
       [:div.overflow-hidden {:on-mouse-down (fn [e] (util/stop e))}
        [:div.my-1 {:style {:font-size 10}}
@@ -68,37 +90,42 @@
         [:a.mr-2 {:on-click #(swap! *zen-mode? not)}
          (util/format "Zen Mode (%s)" (if @*zen-mode? "ON" "OFF"))]
         [:a.mr-2 {:on-click #(swap! *view-mode? not)}
-         (util/format "View Mode (%s)" (if @*view-mode? "ON" "OFF"))]]
+         (util/format "View Mode (%s)" (if @*view-mode? "ON" "OFF"))]
+        [:a.mr-2 {:on-click #(swap! *grid-mode? not)}
+         (util/format "Grid Mode (%s)" (if @*grid-mode? "ON" "OFF"))]
+        [:a.mr-2 {:on-click #(when-let [block (db/pull [:block/uuid block-uuid])]
+                               (editor-handler/edit-block! block :max block-uuid))}
+         "Edit Block"]]
        [:div.draw-wrap
-        {:on-mouse-down (fn [e]
+        {:ref ref
+         :on-mouse-down (fn [e]
                           (util/stop e)
                           (state/set-block-component-editing-mode! true))
-         :on-blur #(state/set-block-component-editing-mode! false)}
+         :on-blur #(state/set-block-component-editing-mode! false)
+         :style {:width  @*draw-width
+                 :height (if wide-mode? 650 500)}}
         (excalidraw
          (merge
-          {:on-change (fn [elements state]
-                        (let [elements->clj (bean/->clj elements)]
-                          (when (and (seq elements->clj)
-                                     (not= elements @*elements))
-                            (let [state (bean/->clj state)]
+          {:on-change (fn [elements app-state files]
+                        (when-not (or (= "down" (gobj/get app-state "cursorButton"))
+                                      (gobj/get app-state "draggingElement")
+                                      (gobj/get app-state "editingElement")
+                                      (gobj/get app-state "editingGroupId")
+                                      (gobj/get app-state "editingLinearElement"))
+                          (let [elements->clj (js->clj elements {:keywordize-keys true})]
+                            (when (and (seq elements->clj)
+                                       (not= elements->clj @*elements)) ;; not= requires clj collections
+                              (reset! *elements elements->clj)
                               (draw/save-excalidraw!
                                file
-                               (-> {:type "excalidraw"
-                                    :version 2
-                                    :source config/website
-                                    :elements elements
-                                    :appState (select-keys state [:gridSize :viewBackgroundColor])}
-                                   bean/->js
-                                   (js/JSON.stringify)))
-                              (reset! *elements elements)))))
+                               (serializeAsJSON elements app-state files "local"))))))
+
            :zen-mode-enabled @*zen-mode?
            :view-mode-enabled @*view-mode?
-           :grid-mode-enabled false
+           :grid-mode-enabled @*grid-mode?
+           :on-pointer-down #(.. (rum/deref ref) -firstChild focus)
            :initial-data data
-           :width  @*draw-width}
-          (if wide-mode?
-            {:height 650}
-            {:height 500})))]])))
+           :theme (excalidraw-theme (state/sub :ui/theme))}))]])))
 
 (rum/defcs draw-container < rum/reactive
   {:init (fn [state]
@@ -125,13 +152,12 @@
     (when (:file option)
       (cond
         db-restoring?
-        [:div.ls-center
-         (ui/loading "Loading")]
+        [:div.ls-center (ui/loading)]
 
         (false? loading?)
         (draw-inner data option)
 
-        :else                           ; loading
+        :else
         nil))))
 
 (rum/defc draw < rum/reactive
@@ -139,5 +165,8 @@
   (let [repo (state/get-current-repo)
         granted? (state/sub [:nfs/user-granted? repo])]
     ;; Web granted
-    (when-not (and (config/local-db? repo) (not granted?) (not (util/electron?)))
+    (when-not (and (config/local-db? repo)
+                   (not granted?)
+                   (not (util/electron?))
+                   (not (mobile-util/native-platform?)))
       (draw-container option))))

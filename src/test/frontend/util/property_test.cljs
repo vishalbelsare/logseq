@@ -49,7 +49,7 @@
       "** hello"
 
       (property/remove-properties :markdown "** hello\nx:: y\na::b\n")
-      "** hello\na::b"))
+      "** hello"))
 
   (testing "properties with blank lines"
     (are [x y] (= x y)
@@ -71,12 +71,20 @@
       "** hello\n\na:: b")))
 
 (deftest test-get-property-keys
-  (are [x y] (= x y)
-    (property/get-property-keys :org "hello\n:PROPERTIES:\n:x1: y1\n:x2: y2\n:END:\n")
-    ["X1" "X2"]
+  (testing "org mode"
+    (are [x y] (= x y)
+        (property/get-property-keys :org "hello\n:PROPERTIES:\n:x1: y1\n:x2: y2\n:END:\n")
+        ["X1" "X2"]
 
-    (property/get-property-keys :org "hello\n:PROPERTIES:\n:END:\n")
-    nil))
+        (property/get-property-keys :org "hello\n:PROPERTIES:\n:END:\n")
+        nil))
+  (testing "markdown mode"
+    (are [x y] (= x y)
+        (property/get-property-keys :markdown "hello\nx1:: y1\nx2:: y2\n")
+        ["X1" "X2"]
+
+        (property/get-property-keys :markdown "hello\n")
+        nil)))
 
 (deftest test-insert-property
   (are [x y] (= x y)
@@ -144,30 +152,19 @@ SCHEDULED: <2021-10-25 Mon>\n:PROPERTIES:\n:a: b\n:END:\nworld\n" "c" "d")
     "a\nfoo:: [[bar]], [[baz]]\nb"
 
     (property/insert-properties :markdown "" {:foo "\"bar, baz\""})
-    "foo:: \"bar, baz\""))
+    "foo:: \"bar, baz\""
 
-(deftest test->new-properties
-  (are [x y] (= (property/->new-properties x) y)
-    ":PROPERTIES:\n:foo: bar\n:END:"
-    "foo:: bar"
+    (property/insert-properties :markdown "abcd\nempty::" {:id "123" :foo "bar"})
+    "abcd\nempty::\nid:: 123\nfoo:: bar"
 
-    "hello\n:PROPERTIES:\n:foo: bar\n:END:"
-    "hello\nfoo:: bar"
+    (property/insert-properties :markdown "abcd\nempty:: " {:id "123" :foo "bar"})
+    "abcd\nempty:: \nid:: 123\nfoo:: bar"
 
-    "hello\n:PROPERTIES:\n:foo: bar\n:nice: bingo\n:END:"
-    "hello\nfoo:: bar\nnice:: bingo"
+    (property/insert-properties :markdown "abcd\nempty::" {:id "123"})
+    "abcd\nempty::\nid:: 123"
 
-    "hello\n:PROPERTIES:\n:foo: bar\n:nice: bingo\n:END:"
-    "hello\nfoo:: bar\nnice:: bingo"
-
-    "hello\n:PROPERTIES:\n:foo: bar\n:nice: bingo\n:END:\nnice"
-    "hello\nfoo:: bar\nnice:: bingo\nnice"
-
-    "hello\n:PROPERTIES:\n:foo: bar\n:nice:\n:END:\nnice"
-    "hello\nfoo:: bar\nnice:: \nnice"
-
-    "hello\n:PROPERTIES:\n:foo: bar\n:nice\n:END:\nnice"
-    "hello\nfoo:: bar\n:nice\nnice"))
+    (property/insert-properties :markdown "abcd\nempty::\nanother-empty::" {:id "123"})
+    "abcd\nempty::\nanother-empty::\nid:: 123"))
 
 (deftest test-build-properties-str
   (are [x y] (= (property/build-properties-str :mardown x) y)
@@ -203,16 +200,49 @@ SCHEDULED: <2021-10-25 Mon>\n:PROPERTIES:\n:a: b\n:END:\nworld\n" "c" "d")
 
     (let [org-property ":PROPERTIES:\n:query-table: true\n:END:"]
       (are [x y] (= (property/with-built-in-properties {:query-table true} x :org) y)
-       content
-       (str org-property "\n" content)
+        content
+        (str org-property "\n" content)
 
-       "title"
-       (str "title\n" org-property)
+        "title"
+        (str "title\n" org-property)
 
-       "title\nbody"
-       (str "title\n" org-property "\nbody")
+        "title\nbody"
+        (str "title\n" org-property "\nbody")
 
-       "1. list"
-       (str org-property "\n1. list")))))
+        "1. list"
+        (str org-property "\n1. list")))))
 
-#_(cljs.test/run-tests)
+(deftest get-visible-ordered-properties
+  (testing "basic cases"
+    (are [x y expected] (= expected (property/get-visible-ordered-properties x y {}))
+      ;; returns in property order
+      {:prop "val" :prop2 "val2"} [:prop2 :prop]
+      [[:prop2 "val2"] [:prop "val"]]
+      ;; returns empty non-nil value if properties is non-nil
+      {} [:prop]
+      '()
+      ;; returns nil if properties is nil
+      nil []
+      nil))
+
+  (testing "hidden properties"
+    (are [x y z expected] (= expected (property/get-visible-ordered-properties x y z))
+      ;; page block
+      {:logseq.order-list-type "number" :foo "bar"}  [:logseq.order-list-type :foo] {:pre-block false}
+      [[:foo "bar"]]
+      ;; normal block
+      {:logseq.order-list-type "number" :foo "bar"}  [:logseq.order-list-type :foo] {:pre-block false}
+      [[:foo "bar"]]))
+
+  (testing "hidden editable properties"
+    (are [x y z expected] (= expected (property/get-visible-ordered-properties x y z))
+      ;; page block
+      {:title "foo"} [:title] {:pre-block? true}
+      '()
+      {:title "foo" :foo "bar"} [:title :foo] {:pre-block? true}
+      [[:foo "bar"]]
+      ;; normal block
+      {:logseq.table.version 2} [:logseq.table.version] {:pre-block? false}
+      '()
+      {:logseq.table.version 2 :foo "bar"} [:logseq.table.version :foo] {:pre-block? false}
+      [[:foo "bar"]])))

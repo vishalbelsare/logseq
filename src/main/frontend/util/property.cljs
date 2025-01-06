@@ -1,48 +1,44 @@
 (ns frontend.util.property
+  "Property fns needed by the rest of the app and not graph-parser"
   (:require [clojure.string :as string]
             [frontend.util :as util]
             [clojure.set :as set]
             [frontend.config :as config]
-            [medley.core :as medley]
+            [logseq.graph-parser.util :as gp-util]
+            [logseq.graph-parser.mldoc :as gp-mldoc]
+            [logseq.graph-parser.property :as gp-property :refer [properties-start properties-end]]
+            [logseq.graph-parser.util.page-ref :as page-ref]
             [frontend.format.mldoc :as mldoc]
-            [frontend.text :as text]
+            [logseq.graph-parser.text :as text]
+            [frontend.db :as db]
+            [frontend.state :as state]
             [frontend.util.cursor :as cursor]
-            [frontend.handler.link :as link]))
+            [frontend.util.block-content :as content]))
 
-(defonce properties-start ":PROPERTIES:")
-(defonce properties-end ":END:")
-(defonce properties-end-pattern
-  (re-pattern (util/format "%s[\t\r ]*\n|(%s\\s*$)" properties-end properties-end)))
-
-(def built-in-extended-properties (atom #{}))
-(defn register-built-in-properties
-  [props]
-  (reset! built-in-extended-properties (set/union @built-in-extended-properties props)))
-
-(defn built-in-properties
+(defn hidden-properties
+  "These are properties hidden from user including built-in ones and ones
+  configured by user"
   []
   (set/union
-   #{:id :custom-id :background-color :heading :collapsed :created-at :updated-at :last-modified-at :created_at :last_modified_at :query-table :query-properties :query-sort-by :query-sort-desc
-     :ls-type :hl-type :hl-page :hl-stamp}
-   (set (map keyword config/markers))
-   (set (config/get-block-hidden-properties))
-   @built-in-extended-properties))
+   (gp-property/hidden-built-in-properties)
+   (set (config/get-block-hidden-properties))))
 
-(defn properties-built-in?
+;; TODO: Investigate if this behavior is correct for configured hidden
+;; properties and for editable built in properties
+(def built-in-properties
+  "Alias to hidden-properties to keep existing behavior"
+  hidden-properties)
+
+(defn properties-hidden?
   [properties]
   (and (seq properties)
        (let [ks (map (comp keyword string/lower-case name) (keys properties))
-             built-in-properties-set (built-in-properties)]
-         (every? built-in-properties-set ks))))
-
-(defn contains-properties?
-  [content]
-  (and (string/includes? content properties-start)
-       (util/safe-re-find properties-end-pattern content)))
+             hidden-properties-set (hidden-properties)]
+         (every? hidden-properties-set ks))))
 
 (defn remove-empty-properties
   [content]
-  (if (contains-properties? content)
+  (if (gp-property/contains-properties? content)
     (string/replace content
                     (re-pattern ":PROPERTIES:\n+:END:\n*")
                     "")
@@ -52,13 +48,13 @@
   [line]
   (boolean
    (and (string? line)
-        (util/safe-re-find #"^\s?[^ ]+:: " line))))
+        (re-find (re-pattern (str "^\\s?[^ ]+" gp-property/colons)) line))))
 
 (defn front-matter-property?
   [line]
   (boolean
    (and (string? line)
-        (util/safe-re-find #"^\s*[^ ]+: " line))))
+        (util/safe-re-find #"^\s*[^ ]+:" line))))
 
 (defn get-property-key
   [line format]
@@ -101,9 +97,10 @@
 (defn get-markdown-property-keys
   [content]
   (let [content-lines (string/split-lines content)
-        properties (filter #(re-matches #"^.+::\s*.+" %) content-lines)]
+        properties (filter #(re-matches (re-pattern (str "^.+" gp-property/colons "\\s*.+")) %)
+                           content-lines)]
     (when (seq properties)
-      (map #(->> (string/split % "::")
+      (map #(->> (string/split % gp-property/colons)
                  (remove string/blank?)
                  first
                  string/upper-case)
@@ -112,7 +109,7 @@
 (defn get-property-keys
   [format content]
   (cond
-    (contains-properties? content)
+    (gp-property/contains-properties? content)
     (get-org-property-keys content)
 
     (= :markdown format)
@@ -123,13 +120,8 @@
   (let [key (string/upper-case key)]
     (contains? (set (util/remove-first #{key} (get-property-keys format content))) key)))
 
-(defn goto-properties-beginning
-  [format input]
-  (cursor/move-cursor-to-thing input properties-start 0)
-  (cursor/move-cursor-forward input (count properties-start)))
-
 (defn goto-properties-end
-  [format input]
+  [_format input]
   (cursor/move-cursor-to-thing input properties-start 0)
   (let [from (cursor/pos input)]
     (cursor/move-cursor-to-thing input properties-end from)))
@@ -137,7 +129,7 @@
 (defn remove-properties
   [format content]
   (cond
-    (contains-properties? content)
+    (gp-property/contains-properties? content)
     (let [lines (string/split-lines content)
           [title-lines properties&body] (split-with #(-> (string/triml %)
                                                          string/upper-case
@@ -178,7 +170,7 @@
   [format properties]
   (when (seq properties)
     (let [org? (= format :org)
-          kv-format (if org? ":%s: %s" "%s:: %s")
+          kv-format (if org? ":%s: %s" (str "%s" gp-property/colons " %s"))
           full-format (if org? ":PROPERTIES:\n%s\n:END:" "%s\n")
           properties-content (->> (map (fn [[k v]] (util/format kv-format (name k) v)) properties)
                                   (string/join "\n"))]
@@ -191,7 +183,7 @@
         properties (filter (fn [[k _v]] ((built-in-properties) k)) properties)]
     (if (seq properties)
       (let [lines (string/split-lines content)
-            ast (mldoc/->edn content (mldoc/default-config format))
+            ast (mldoc/->edn content (gp-mldoc/default-config format))
             [title body] (if (mldoc/block-with-title? (first (ffirst ast)))
                            [(first lines) (rest lines)]
                            [nil lines])
@@ -215,7 +207,7 @@
             built-in-properties-area (map (fn [[k v]]
                                             (if org?
                                               (str ":" (name k) ": " v)
-                                              (str (name k) ":: " v))) properties)
+                                              (str (name k) gp-property/colons " " v))) properties)
             body (concat (if no-title? nil [title])
                          (when org? [properties-start])
                          built-in-properties-area
@@ -232,19 +224,23 @@
   (string/starts-with? s "---\n"))
 
 (defn insert-property
+  "Only accept nake content (without any indentation)"
   ([format content key value]
    (insert-property format content key value false))
   ([format content key value front-matter?]
    (when (string? content)
-     (let [ast (mldoc/->edn content (mldoc/default-config format))
-           title? (mldoc/block-with-title? (ffirst (map first ast)))
+     (let [ast (content/get-ast content format)
+           title? (content/has-title? content format)
            has-properties? (or (and title?
-                                    (mldoc/properties? (second ast)))
+                                    (or (mldoc/properties? (second ast))
+                                        (mldoc/properties? (second
+                                                            (remove
+                                                             (fn [[x _]]
+                                                               (contains? #{"Hiccup" "Raw_Html"} (first x)))
+                                                             ast)))))
                                (mldoc/properties? (first ast)))
            lines (string/split-lines content)
-           [title body] (if title?
-                          [(first lines) (string/join "\n" (rest lines))]
-                          [nil (string/join "\n" lines)])
+           [title body] (content/get-title&body content format)
            scheduled (filter #(string/starts-with? % "SCHEDULED") lines)
            deadline (filter #(string/starts-with? % "DEADLINE") lines)
            body-without-timestamps (filter
@@ -269,7 +265,7 @@
                           middle (doall
                                   (->> (subvec lines (inc start-idx) end-idx)
                                        (mapv (fn [text]
-                                               (let [[k v] (util/split-first ":" (subs text 1))]
+                                               (let [[k v] (gp-util/split-first ":" (subs text 1))]
                                                  (if (and k v)
                                                    (let [key-exists? (= k key)
                                                          _ (when key-exists? (reset! exists? true))
@@ -283,7 +279,7 @@
 
                     (not org?)
                     (let [exists? (atom false)
-                          sym (if front-matter? ": " ":: ")
+                          sym (if front-matter? ": " (str gp-property/colons " "))
                           new-property-s (str key sym value)
                           property-f (if front-matter? front-matter-property? simplified-property?)
                           groups (partition-by property-f lines)
@@ -292,7 +288,7 @@
                                                     (if (property-f (first lines))
                                                       (let [lines (doall
                                                                    (mapv (fn [text]
-                                                                           (let [[k v] (util/split-first sym text)]
+                                                                           (let [[k v] (gp-util/split-first sym text)]
                                                                              (if (and k v)
                                                                                (let [key-exists? (= k key)
                                                                                      _ (when key-exists? (reset! exists? true))
@@ -331,7 +327,7 @@
                (some->>
                 (seq v)
                 (distinct)
-                (map (fn [item] (util/format "[[%s]]" (text/page-ref-un-brackets! item))))
+                (map (fn [item] (page-ref/->page-ref (text/page-ref-un-brackets! item))))
                 (string/join ", "))
                v)]
        (insert-property format content k v)))
@@ -345,57 +341,44 @@
      (let [format (or format :markdown)
            key (string/lower-case (name key))
            remove-f (if first? util/remove-first remove)]
-       (if (and (= format :org) (not (contains-properties? content)))
+       (if (and (= format :org) (not (gp-property/contains-properties? content)))
          content
          (let [lines (->> (string/split-lines content)
                           (remove-f (fn [line]
                                       (let [s (string/triml (string/lower-case line))]
                                         (or (string/starts-with? s (str ":" key ":"))
-                                            (string/starts-with? s (str key ":: ")))))))]
+                                            (string/starts-with? s (str key gp-property/colons " ")))))))]
            (string/join "\n" lines)))))))
 
 (defn remove-id-property
   [format content]
   (remove-property format "id" content false))
 
-;; FIXME: only remove from the properties area
+;; FIXME: remove only from the properties area, not other blocks such as
+;; code blocks, quotes, etc.
+;; Currently, this function will do nothing if the content is a code block.
+;; The future plan is to separate those properties from the block' content.
 (defn remove-built-in-properties
   [format content]
-  (let [built-in-properties* (built-in-properties)
-        content (reduce (fn [content key]
-                          (remove-property format key content)) content built-in-properties*)]
-    (if (= format :org)
-      (string/replace-first content (re-pattern ":PROPERTIES:\n:END:\n*") "")
-      content)))
-
-(defn ->new-properties
-  "New syntax: key:: value"
-  [content]
-  (if (contains-properties? content)
-    (let [lines (string/split-lines content)
-          start-idx (.indexOf lines properties-start)
-          end-idx (.indexOf lines properties-end)]
-      (if (and (>= start-idx 0) (> end-idx 0) (> end-idx start-idx))
-        (let [before (subvec lines 0 start-idx)
-              middle (->> (subvec lines (inc start-idx) end-idx)
-                          (map (fn [text]
-                                 (let [[k v] (util/split-first ":" (subs text 1))]
-                                   (if (and k v)
-                                     (let [k (string/replace k "_" "-")
-                                           compare-k (keyword (string/lower-case k))
-                                           k (if (contains? #{:id :custom_id :custom-id} compare-k) "id" k)
-                                           k (if (contains? #{:last-modified-at} compare-k) "updated-at" k)]
-                                       (str k ":: " (string/trim v)))
-                                     text)))))
-              after (subvec lines (inc end-idx))
-              lines (concat before middle after)]
-          (string/join "\n" lines))
-        content))
-    content))
+  (let [trim-content (some-> content string/trim)]
+    (if (or
+         (and (= format :markdown)
+              (string/starts-with? trim-content "```")
+              (string/ends-with? trim-content "```"))
+         (and (= format :org)
+              (string/starts-with? trim-content "#+BEGIN_SRC")
+              (string/ends-with? trim-content "#+END_SRC")))
+      content
+      (let [built-in-properties* (built-in-properties)
+            content (reduce (fn [content key]
+                              (remove-property format key content)) content built-in-properties*)]
+        (if (= format :org)
+          (string/replace-first content (re-pattern ":PROPERTIES:\n:END:\n*") "")
+          content)))))
 
 (defn add-page-properties
   [page-format properties-content properties]
-  (let [properties (medley/map-keys name properties)
+  (let [properties (update-keys properties name)
         lines (string/split-lines properties-content)
         front-matter-format? (contains? #{:markdown} page-format)
         lines (if front-matter-format?
@@ -433,41 +416,49 @@
      (config/properties-wrapper-pattern page-format)
      (string/join "\n" lines))))
 
-(defn properties-ast?
-  [block]
-  (and
-   (vector? block)
-   (contains? #{"Property_Drawer" "Properties"}
-              (first block))))
+(def hidden-editable-page-properties
+  "Properties that are hidden in the pre-block (page property)"
+  #{:title :filters :icon})
 
-(defonce non-parsing-properties
-  (atom #{"background-color" "background_color"}))
+(assert (set/subset? hidden-editable-page-properties (gp-property/editable-built-in-properties))
+        "Hidden editable page properties must be valid editable properties")
 
-(defn parse-property
-  [k v]
-  (let [k (name k)
-        v (if (or (symbol? v) (keyword? v)) (name v) (str v))
-        v (string/trim v)]
-    (cond
-      (contains? #{"title" "filters"} k)
-      v
+(def hidden-editable-block-properties
+  "Properties that are hidden in a block (block property)"
+  (into #{:logseq.query/nlp-date}
+        gp-property/editable-view-and-table-properties))
 
-      (= v "true")
-      true
-      (= v "false")
-      false
+(assert (set/subset? hidden-editable-block-properties (gp-property/editable-built-in-properties))
+        "Hidden editable page properties must be valid editable properties")
 
-      (util/safe-re-find #"^\d+$" v)
-      (util/safe-parse-int v)
+(defn- add-aliases-to-properties
+  "Adds aliases to a page when a page has aliases and is also an alias of other pages"
+  [properties page-id]
+  (let [repo (state/get-current-repo)
+        aliases (db/get-page-alias-names repo
+                                         (:block/name (db/pull page-id)))]
+    (if (seq aliases)
+      (if (:alias properties)
+        (update properties :alias (fn [c]
+                                    (util/distinct-by string/lower-case (concat c aliases))))
+        (assoc properties :alias aliases))
+      properties)))
 
-      (util/wrapped-by-quotes? v) ; wrapped in ""
-      (util/unquote-string v)
-
-      (contains? @non-parsing-properties (string/lower-case k))
-      v
-
-      (link/link? v)
-      v
-
-      :else
-      (text/split-page-refs-without-brackets v))))
+(defn get-visible-ordered-properties
+  "Given a block's properties, order of properties and any display context,
+  returns a tuple of property pairs that are visible when not being edited"
+  [properties* properties-order {:keys [pre-block? page-id]}]
+  (let [dissoc-keys (fn [m keys] (apply dissoc m keys))
+        properties (cond-> (update-keys properties* keyword)
+                     true
+                     (dissoc-keys (hidden-properties))
+                     pre-block?
+                     (dissoc-keys hidden-editable-page-properties)
+                     (not pre-block?)
+                     (dissoc-keys hidden-editable-block-properties)
+                     pre-block?
+                     (add-aliases-to-properties page-id))]
+    (if (seq properties-order)
+      (keep (fn [k] (when (contains? properties k) [k (get properties k)]))
+            (distinct properties-order))
+      properties*)))

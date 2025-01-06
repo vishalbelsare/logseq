@@ -1,4 +1,4 @@
-(ns frontend.external.roam-export
+(ns ^:no-doc frontend.external.roam-export
   (:require [clojure.set :as s]
             [clojure.string :as str]
             [clojure.walk :as walk]
@@ -21,26 +21,27 @@
        (str/join)))
 
 (defn uuid->uid-map []
-  (let [conn (db/get-conn (state/get-current-repo))]
-    (->> conn
+  (let [db (db/get-db (state/get-current-repo))]
+    (->>
      (d/q '[:find (pull ?r [:block/uuid])
             :in $
             :where
-            [?b :block/refs ?r]])
+            [?b :block/refs ?r]] db)
      (map (comp :block/uuid first))
      (distinct)
      (map (fn [uuid] [uuid (nano-id)]))
      (into {}))))
 
 (defn update-content [content uuid->uid-map]
-  (let [uuids (keys uuid->uid-map)]
-    (reduce
-     (fn [acc uuid]
-       (if (str/includes? acc (str uuid))
-         (str/replace acc (str uuid) (get uuid->uid-map uuid))
-         acc))
-     content
-     uuids)))
+  (when content                         ; page block doesn't have content
+    (let [uuids (keys uuid->uid-map)]
+     (reduce
+      (fn [acc uuid]
+        (if (str/includes? acc (str uuid))
+          (str/replace acc (str uuid) (get uuid->uid-map uuid))
+          acc))
+      content
+      uuids))))
 
 (defn update-uid [{:block/keys [uuid content] :as b}
                   uuid->uid-map]

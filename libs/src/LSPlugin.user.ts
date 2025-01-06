@@ -1,7 +1,16 @@
-import { deepMerge, safetyPathJoin } from './helpers'
-import { LSPluginCaller } from './LSPlugin.caller'
 import {
-  IAppProxy, IDBProxy,
+  isValidUUID,
+  deepMerge,
+  mergeSettingsWithSchema,
+  PluginLogger,
+  safeSnakeCase,
+  safetyPathJoin, normalizeKeyStr,
+} from './helpers'
+import { LSPluginCaller } from './LSPlugin.caller'
+import * as callableAPIs from './callable.apis'
+import {
+  IAppProxy,
+  IDBProxy,
   IEditorProxy,
   ILSPluginUser,
   LSPluginBaseInfo,
@@ -9,25 +18,46 @@ import {
   SlashCommandAction,
   BlockCommandCallback,
   StyleString,
-  ThemeOptions,
-  UIOptions, IHookEvent, BlockIdentity,
+  Theme,
+  UIOptions,
+  IHookEvent,
+  BlockIdentity,
   BlockPageName,
-  UIContainerAttrs, SimpleCommandCallback, SimpleCommandKeybinding
+  UIContainerAttrs,
+  SimpleCommandCallback,
+  SimpleCommandKeybinding,
+  SettingSchemaDesc,
+  IUserOffHook,
+  IGitProxy,
+  IUIProxy,
+  UserProxyTags,
+  BlockUUID,
+  BlockEntity,
+  IDatom,
+  IAssetsProxy,
+  AppInfo,
+  IPluginSearchServiceHooks,
 } from './LSPlugin'
 import Debug from 'debug'
 import * as CSS from 'csstype'
-import { snakeCase } from 'snake-case'
 import EventEmitter from 'eventemitter3'
-import { LSPluginFileStorage } from './modules/LSPlugin.Storage'
+import { IAsyncStorage, LSPluginFileStorage } from './modules/LSPlugin.Storage'
+import { LSPluginExperiments } from './modules/LSPlugin.Experiments'
+import { LSPluginRequest } from './modules/LSPlugin.Request'
+import { LSPluginSearchService } from './modules/LSPlugin.Search'
 
 declare global {
   interface Window {
     __LSP__HOST__: boolean
+    logseq: LSPluginUser
   }
 }
 
+type callableMethods = keyof typeof callableAPIs | string // host exported SDK apis & host platform related apis
+
 const PROXY_CONTINUE = Symbol.for('proxy-continue')
 const debug = Debug('LSPlugin:user')
+const logger = new PluginLogger('', { console: true })
 
 /**
  * @param type (key of group commands)
@@ -38,55 +68,138 @@ function registerSimpleCommand (
   this: LSPluginUser,
   type: string,
   opts: {
-    key: string,
-    label: string,
-    desc?: string,
-    palette?: boolean,
+    key: string
+    label: string
+    desc?: string
+    palette?: boolean
     keybinding?: SimpleCommandKeybinding
+    extras?: Record<string, any>
   },
   action: SimpleCommandCallback
 ) {
+  const { key, label, desc, palette, keybinding, extras } = opts
+
   if (typeof action !== 'function') {
+    this.logger.error(`${key || label}: command action should be function.`)
     return false
   }
 
-  const { key, label, desc, palette, keybinding } = opts
-  const eventKey = `SimpleCommandHook${key}${++registeredCmdUid}`
+  const normalizedKey = normalizeKeyStr(key)
+
+  if (!normalizedKey) {
+    this.logger.error(`${label}: command key is required.`)
+    return false
+  }
+
+  const eventKey = `SimpleCommandHook${normalizedKey}${++registeredCmdUid}`
 
   this.Editor['on' + eventKey](action)
 
   this.caller?.call(`api:call`, {
     method: 'register-plugin-simple-command',
-    args: [this.baseInfo.id, [{ key, label, type, desc, keybinding }, ['editor/hook', eventKey]], palette]
+    args: [
+      this.baseInfo.id,
+      // [cmd, action]
+      [
+        { key: normalizedKey, label, type, desc, keybinding, extras },
+        ['editor/hook', eventKey],
+      ],
+      palette,
+    ],
   })
 }
 
+function shouldValidUUID (uuid: string) {
+  if (!isValidUUID(uuid)) {
+    logger.error(`#${uuid} is not a valid UUID string.`)
+    return false
+  }
+
+  return true
+}
+
+function checkEffect (p: LSPluginUser) {
+  return p && (p.baseInfo?.effect || !p.baseInfo?.iir)
+}
+
+let _appBaseInfo: AppInfo = null
+let _searchServices: Map<string, LSPluginSearchService> = new Map()
+
 const app: Partial<IAppProxy> = {
+  async getInfo (this: LSPluginUser, key) {
+    if (!_appBaseInfo) {
+      _appBaseInfo = await this._execCallableAPIAsync('get-app-info')
+    }
+    return typeof key === 'string' ? _appBaseInfo[key] : _appBaseInfo
+  },
+
   registerCommand: registerSimpleCommand,
 
-  registerCommandPalette (
-    opts: { key: string; label: string, keybinding?: SimpleCommandKeybinding },
-    action: SimpleCommandCallback) {
+  registerSearchService<T extends IPluginSearchServiceHooks> (
+    this: LSPluginUser,
+    s: T
+  ) {
+    if (_searchServices.has(s.name)) {
+      throw new Error(`SearchService: #${s.name} has registered!`)
+    }
 
+    _searchServices.set(s.name, new LSPluginSearchService(this, s))
+  },
+
+  registerCommandPalette (
+    opts: { key: string; label: string; keybinding?: SimpleCommandKeybinding },
+    action: SimpleCommandCallback
+  ) {
     const { key, label, keybinding } = opts
-    const group = 'global-palette-command'
+    const group = '$palette$'
 
     return registerSimpleCommand.call(
-      this, group,
+      this,
+      group,
       { key, label, palette: true, keybinding },
-      action)
+      action
+    )
+  },
+
+  registerCommandShortcut (
+    keybinding: SimpleCommandKeybinding | string,
+    action: SimpleCommandCallback,
+    opts: Partial<{
+      key: string
+      label: string
+      desc: string
+      extras: Record<string, any>
+    }> = {}
+  ) {
+    if (typeof keybinding == 'string') {
+      keybinding = {
+        mode: 'global',
+        binding: keybinding,
+      }
+    }
+
+    const { binding } = keybinding
+    const group = '$shortcut$'
+    const key = opts.key || (group + safeSnakeCase(binding?.toString()))
+
+    return registerSimpleCommand.call(
+      this,
+      group,
+      { ...opts, key, palette: false, keybinding },
+      action
+    )
   },
 
   registerUIItem (
     type: 'toolbar' | 'pagebar',
-    opts: { key: string, template: string }
+    opts: { key: string; template: string }
   ) {
     const pid = this.baseInfo.id
     // opts.key = `${pid}_${opts.key}`
 
     this.caller?.call(`api:call`, {
       method: 'register-plugin-ui-item',
-      args: [pid, type, opts]
+      args: [pid, type, opts],
     })
   },
 
@@ -103,28 +216,73 @@ const app: Partial<IAppProxy> = {
     const label = tag
     const type = 'page-menu-item'
 
-    registerSimpleCommand.call(this,
-      type, {
-        key, label
-      }, action)
+    registerSimpleCommand.call(
+      this,
+      type,
+      {
+        key,
+        label,
+      },
+      action
+    )
+  },
+
+  onBlockRendererSlotted (uuid, callback: (payload: any) => void) {
+    if (!shouldValidUUID(uuid)) return
+
+    const pid = this.baseInfo.id
+    const hook = `hook:editor:${safeSnakeCase(`slot:${uuid}`)}`
+
+    this.caller.on(hook, callback)
+    this.App._installPluginHook(pid, hook)
+
+    return () => {
+      this.caller.off(hook, callback)
+      this.App._uninstallPluginHook(pid, hook)
+    }
+  },
+
+  invokeExternalPlugin (this: LSPluginUser, type: string, ...args: Array<any>) {
+    type = type?.trim()
+    if (!type) return
+    let [pid, group] = type.split('.')
+    if (!['models', 'commands'].includes(group?.toLowerCase())) {
+      throw new Error(`Type only support '.models' or '.commands' currently.`)
+    }
+    const key = type.replace(`${pid}.${group}.`, '')
+
+    if (!pid || !group || !key) {
+      throw new Error(`Illegal type of #${type} to invoke external plugin.`)
+    }
+    return this._execCallableAPIAsync(
+      'invoke_external_plugin_cmd',
+      pid,
+      group.toLowerCase(),
+      key,
+      args
+    )
   },
 
   setFullScreen (flag) {
     const sf = (...args) => this._callWin('setFullScreen', ...args)
 
     if (flag === 'toggle') {
-      this._callWin('isFullScreen').then(r => {
+      this._callWin('isFullScreen').then((r) => {
         r ? sf() : sf(true)
       })
     } else {
       flag ? sf(true) : sf()
     }
-  }
+  },
 }
 
 let registeredCmdUid = 0
 
 const editor: Partial<IEditorProxy> = {
+  newBlockUUID (this: LSPluginUser): Promise<string> {
+    return this._execCallableAPIAsync('new_block_uuid')
+  },
+
   registerSlashCommand (
     this: LSPluginUser,
     tag: string,
@@ -136,7 +294,7 @@ const editor: Partial<IEditorProxy> = {
       actions = [
         ['editor/clear-current-slash', false],
         ['editor/restore-saved-cursor'],
-        ['editor/hook', actions]
+        ['editor/hook', actions],
       ]
     }
 
@@ -169,60 +327,153 @@ const editor: Partial<IEditorProxy> = {
 
     this.caller?.call(`api:call`, {
       method: 'register-plugin-slash-command',
-      args: [this.baseInfo.id, [tag, actions]]
+      args: [this.baseInfo.id, [tag, actions]],
     })
   },
 
   registerBlockContextMenuItem (
     this: LSPluginUser,
-    tag: string,
+    label: string,
     action: BlockCommandCallback
   ) {
     if (typeof action !== 'function') {
       return false
     }
 
-    const key = tag + '_' + this.baseInfo.id
-    const label = tag
+    const key = label + '_' + this.baseInfo.id
     const type = 'block-context-menu-item'
 
-    registerSimpleCommand.call(this,
-      type, {
-        key, label
-      }, action)
+    registerSimpleCommand.call(
+      this,
+      type,
+      {
+        key,
+        label,
+      },
+      action
+    )
+  },
+
+  registerHighlightContextMenuItem (
+    this: LSPluginUser,
+    label: string,
+    action: SimpleCommandCallback,
+    opts?: { clearSelection: boolean }
+  ) {
+    if (typeof action !== 'function') {
+      return false
+    }
+
+    const key = label + '_' + this.baseInfo.id
+    const type = 'highlight-context-menu-item'
+
+    registerSimpleCommand.call(
+      this,
+      type,
+      {
+        key,
+        label,
+        extras: opts,
+      },
+      action
+    )
   },
 
   scrollToBlockInPage (
     this: LSPluginUser,
     pageName: BlockPageName,
-    blockId: BlockIdentity
+    blockId: BlockIdentity,
+    opts?: { replaceState: boolean }
   ) {
     const anchor = `block-content-` + blockId
-    this.App.pushState(
-      'page',
-      { name: pageName },
-      { anchor }
-    )
-  }
+    if (opts?.replaceState) {
+      this.App.replaceState('page', { name: pageName }, { anchor })
+    } else {
+      this.App.pushState('page', { name: pageName }, { anchor })
+    }
+  },
 }
 
-const db: Partial<IDBProxy> = {}
+const db: Partial<IDBProxy> = {
+  onBlockChanged (
+    this: LSPluginUser,
+    uuid: BlockUUID,
+    callback: (
+      block: BlockEntity,
+      txData: Array<IDatom>,
+      txMeta?: { outlinerOp: string; [p: string]: any }
+    ) => void
+  ): IUserOffHook {
+    if (!shouldValidUUID(uuid)) return
+
+    const pid = this.baseInfo.id
+    const hook = `hook:db:${safeSnakeCase(`block:${uuid}`)}`
+    const aBlockChange = ({ block, txData, txMeta }) => {
+      if (block.uuid !== uuid) {
+        return
+      }
+
+      callback(block, txData, txMeta)
+    }
+
+    this.caller.on(hook, aBlockChange)
+    this.App._installPluginHook(pid, hook)
+
+    return () => {
+      this.caller.off(hook, aBlockChange)
+      this.App._uninstallPluginHook(pid, hook)
+    }
+  },
+
+  datascriptQuery<T = any> (
+    this: LSPluginUser,
+    query: string,
+    ...inputs: Array<any>
+  ): Promise<T> {
+    // force remove proxy ns flag `db`
+    inputs.pop()
+
+    if (inputs?.some((it) => typeof it === 'function')) {
+      const host = this.Experiments.ensureHostScope()
+      return host.logseq.api.datascript_query(query, ...inputs)
+    }
+
+    return this._execCallableAPIAsync(`datascript_query`, ...[query, ...inputs])
+  },
+}
+
+const git: Partial<IGitProxy> = {}
+
+const ui: Partial<IUIProxy> = {}
+
+const assets: Partial<IAssetsProxy> = {
+  makeSandboxStorage (this: LSPluginUser): IAsyncStorage {
+    return new LSPluginFileStorage(this, { assets: true })
+  },
+}
 
 type uiState = {
-  key?: number,
+  key?: number
   visible: boolean
 }
 
 const KEY_MAIN_UI = 0
 
 /**
- * User plugin instance
+ * User plugin instance from global namespace `logseq`.
+ * @example
+ * ```ts
+ * logseq.UI.showMsg('Hello, Logseq')
+ * ```
  * @public
  */
-export class LSPluginUser extends EventEmitter<LSPluginUserEvents> implements ILSPluginUser {
-  /**
-   * @private
-   */
+export class LSPluginUser
+  extends EventEmitter<LSPluginUserEvents>
+  implements ILSPluginUser {
+  // @ts-ignore
+  private _version: string = LIB_VERSION
+  private _debugTag: string = ''
+  private _settingsSchema?: Array<SettingSchemaDesc>
   private _connected: boolean = false
 
   /**
@@ -231,7 +482,9 @@ export class LSPluginUser extends EventEmitter<LSPluginUserEvents> implements IL
    */
   private _ui = new Map<number, uiState>()
 
-  private _fileStorage: LSPluginFileStorage
+  private _mFileStorage: LSPluginFileStorage
+  private _mRequest: LSPluginRequest
+  private _mExperiments: LSPluginExperiments
 
   /**
    * handler of before unload plugin
@@ -266,26 +519,20 @@ export class LSPluginUser extends EventEmitter<LSPluginUserEvents> implements IL
       const cb = this._beforeunloadCallback
 
       try {
-        cb && await cb(rest)
+        cb && (await cb(rest))
         actor?.resolve(null)
       } catch (e) {
-        console.debug(`${_caller.debugTag} [beforeunload] `, e)
+        this.logger.error(`[beforeunload] `, e)
         actor?.reject(e)
       }
     })
-
-    // modules
-    this._fileStorage = new LSPluginFileStorage(this)
   }
 
-  async ready (
-    model?: any,
-    callback?: any
-  ) {
+  // Life related
+  async ready (model?: any, callback?: any) {
     if (this._connected) return
 
     try {
-
       if (typeof model === 'function') {
         callback = model
         model = {}
@@ -293,17 +540,39 @@ export class LSPluginUser extends EventEmitter<LSPluginUserEvents> implements IL
 
       let baseInfo = await this._caller.connectToParent(model)
 
-      baseInfo = deepMerge(this._baseInfo, baseInfo)
-
       this._connected = true
 
+      baseInfo = deepMerge(this._baseInfo, baseInfo)
+      this._baseInfo = baseInfo
+
       if (baseInfo?.id) {
-        this._caller.debugTag = `#${baseInfo.id} [${baseInfo.name}]`
+        this._debugTag =
+          this._caller.debugTag = `#${baseInfo.id} [${baseInfo.name}]`
+
+        this.logger.setTag(this._debugTag)
+      }
+
+      if (this._settingsSchema) {
+        baseInfo.settings = mergeSettingsWithSchema(
+          baseInfo.settings,
+          this._settingsSchema
+        )
+
+        // TODO: sync host settings schema
+        await this.useSettingsSchema(this._settingsSchema)
+      }
+
+      try {
+        await this._execCallableAPIAsync('setSDKMetadata', {
+          version: this._version,
+        })
+      } catch (e) {
+        console.warn(e)
       }
 
       callback && callback.call(this, baseInfo)
     } catch (e) {
-      console.error('[LSPlugin Ready Error]', e)
+      console.error(`${this._debugTag} [Ready Error]`, e)
     }
   }
 
@@ -323,7 +592,7 @@ export class LSPluginUser extends EventEmitter<LSPluginUserEvents> implements IL
     return this
   }
 
-  provideTheme (theme: ThemeOptions) {
+  provideTheme (theme: Theme) {
     this.caller.call('provider:theme', theme)
     return this
   }
@@ -338,11 +607,39 @@ export class LSPluginUser extends EventEmitter<LSPluginUserEvents> implements IL
     return this
   }
 
+  // Settings related
+  useSettingsSchema (schema: Array<SettingSchemaDesc>) {
+    if (this.connected) {
+      this.caller.call('settings:schema', {
+        schema,
+        isSync: true,
+      })
+    }
+
+    this._settingsSchema = schema
+    return this
+  }
+
   updateSettings (attrs: Record<string, any>) {
     this.caller.call('settings:update', attrs)
     // TODO: update associated baseInfo settings
   }
 
+  onSettingsChanged<T = any> (cb: (a: T, b: T) => void): IUserOffHook {
+    const type = 'settings:changed'
+    this.on(type, cb)
+    return () => this.off(type, cb)
+  }
+
+  showSettingsUI () {
+    this.caller.call('settings:visible:changed', { visible: true })
+  }
+
+  hideSettingsUI () {
+    this.caller.call('settings:visible:changed', { visible: false })
+  }
+
+  // UI related
   setMainUIAttrs (attrs: Partial<UIContainerAttrs>): void {
     this.caller.call('main-ui:attrs', attrs)
   }
@@ -352,14 +649,22 @@ export class LSPluginUser extends EventEmitter<LSPluginUserEvents> implements IL
   }
 
   hideMainUI (opts?: { restoreEditingCursor: boolean }): void {
-    const payload = { key: KEY_MAIN_UI, visible: false, cursor: opts?.restoreEditingCursor }
+    const payload = {
+      key: KEY_MAIN_UI,
+      visible: false,
+      cursor: opts?.restoreEditingCursor,
+    }
     this.caller.call('main-ui:visible', payload)
     this.emit('ui:visible:changed', payload)
     this._ui.set(payload.key, payload)
   }
 
-  showMainUI (): void {
-    const payload = { key: KEY_MAIN_UI, visible: true }
+  showMainUI (opts?: { autoFocus: boolean }): void {
+    const payload = {
+      key: KEY_MAIN_UI,
+      visible: true,
+      autoFocus: opts?.autoFocus,
+    }
     this.caller.call('main-ui:visible', payload)
     this.emit('ui:visible:changed', payload)
     this._ui.set(payload.key, payload)
@@ -375,6 +680,11 @@ export class LSPluginUser extends EventEmitter<LSPluginUserEvents> implements IL
     }
   }
 
+  // Getters
+  get version (): string {
+    return this._version
+  }
+
   get isMainUIVisible (): boolean {
     const state = this._ui.get(KEY_MAIN_UI)
     return Boolean(state && state.visible)
@@ -386,6 +696,14 @@ export class LSPluginUser extends EventEmitter<LSPluginUserEvents> implements IL
 
   get baseInfo (): LSPluginBaseInfo {
     return this._baseInfo
+  }
+
+  get effect (): Boolean {
+    return checkEffect(this)
+  }
+
+  get logger () {
+    return logger
   }
 
   get settings () {
@@ -406,10 +724,7 @@ export class LSPluginUser extends EventEmitter<LSPluginUserEvents> implements IL
   /**
    * @internal
    */
-  _makeUserProxy (
-    target: any,
-    tag?: 'app' | 'editor' | 'db'
-  ) {
+  _makeUserProxy (target: any, tag?: UserProxyTags) {
     const that = this
     const caller = this.caller
 
@@ -419,8 +734,8 @@ export class LSPluginUser extends EventEmitter<LSPluginUserEvents> implements IL
 
         return function (this: any, ...args: any) {
           if (origMethod) {
-            const ret = origMethod.apply(that, args)
-            if (ret !== PROXY_CONTINUE) return
+            const ret = origMethod.apply(that, args.concat(tag))
+            if (ret !== PROXY_CONTINUE) return ret
           }
 
           // Handle hook
@@ -430,32 +745,76 @@ export class LSPluginUser extends EventEmitter<LSPluginUserEvents> implements IL
             if (hookMatcher != null) {
               const f = hookMatcher[0].toLowerCase()
               const s = hookMatcher.input!
-              const e = s.slice(f.length)
+              const isOff = f === 'off'
+              const pid = that.baseInfo.id
 
-              const type = `hook:${tag}:${snakeCase(e)}`
-              const handler = args[0]
+              let type = s.slice(f.length)
+              let handler = args[0]
+              let opts = args[1]
+
+              // condition mode
+              if (typeof handler === 'string' && typeof opts === 'function') {
+                handler = handler.replace(/^logseq./, ':')
+                type = `${type}${handler}`
+                handler = opts
+                opts = args[2]
+              }
+
+              type = `hook:${tag}:${safeSnakeCase(type)}`
+
               caller[f](type, handler)
-              return f !== 'off' ? () => (caller.off(type, handler)) : void 0
+
+              const unlisten = () => {
+                caller.off(type, handler)
+                if (!caller.listenerCount(type)) {
+                  that.App._uninstallPluginHook(pid, type)
+                }
+              }
+
+              if (!isOff) {
+                that.App._installPluginHook(pid, type, opts)
+              } else {
+                unlisten()
+                return
+              }
+
+              return unlisten
             }
+          }
+
+          let method = propKey as string
+
+          if ((['git', 'ui', 'assets'] as UserProxyTags[]).includes(tag)) {
+            method = tag + '_' + method
           }
 
           // Call host
           return caller.callAsync(`api:call`, {
-            tag, method: propKey, args: args
+            tag,
+            method,
+            args: args,
           })
         }
-      }
+      },
     })
   }
 
-  /**
-   * @param args
-   */
-  _callWin (...args) {
+  _execCallableAPIAsync (method: callableMethods, ...args) {
     return this._caller.callAsync(`api:call`, {
-      method: '_callMainWin',
-      args: args
+      method,
+      args,
     })
+  }
+
+  _execCallableAPI (method: callableMethods, ...args) {
+    this._caller.call(`api:call`, {
+      method,
+      args,
+    })
+  }
+
+  _callWin (...args) {
+    return this._execCallableAPIAsync(`_callMainWin`, ...args)
   }
 
   /**
@@ -470,11 +829,37 @@ export class LSPluginUser extends EventEmitter<LSPluginUserEvents> implements IL
   }
 
   get DB (): IDBProxy {
-    return this._makeUserProxy(db)
+    return this._makeUserProxy(db, 'db')
+  }
+
+  get Git (): IGitProxy {
+    return this._makeUserProxy(git, 'git')
+  }
+
+  get UI (): IUIProxy {
+    return this._makeUserProxy(ui, 'ui')
+  }
+
+  get Assets (): IAssetsProxy {
+    return this._makeUserProxy(assets, 'assets')
   }
 
   get FileStorage (): LSPluginFileStorage {
-    return this._fileStorage
+    let m = this._mFileStorage
+    if (!m) m = this._mFileStorage = new LSPluginFileStorage(this)
+    return m
+  }
+
+  get Request (): LSPluginRequest {
+    let m = this._mRequest
+    if (!m) m = this._mRequest = new LSPluginRequest(this)
+    return m
+  }
+
+  get Experiments (): LSPluginExperiments {
+    let m = this._mExperiments
+    if (!m) m = this._mExperiments = new LSPluginExperiments(this)
+    return m
   }
 }
 
@@ -490,8 +875,8 @@ export function setupPluginUserInstance (
   return new LSPluginUser(pluginBaseInfo, pluginCaller)
 }
 
-if (window.__LSP__HOST__ == null) { // Entry of iframe mode
+// entry of iframe mode
+if (window.__LSP__HOST__ == null) {
   const caller = new LSPluginCaller(null)
-  // @ts-ignore
   window.logseq = setupPluginUserInstance({} as any, caller)
 }

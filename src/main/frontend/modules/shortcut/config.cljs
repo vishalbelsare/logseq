@@ -1,9 +1,11 @@
 (ns frontend.modules.shortcut.config
-  (:require [frontend.components.commit :as commit]
+  (:require [clojure.string :as str]
+            [frontend.components.commit :as commit]
             [frontend.extensions.srs.handler :as srs]
             [frontend.extensions.pdf.utils :as pdf-utils]
             [frontend.handler.config :as config-handler]
             [frontend.handler.editor :as editor-handler]
+            [frontend.handler.paste :as paste-handler]
             [frontend.handler.history :as history]
             [frontend.handler.page :as page-handler]
             [frontend.handler.route :as route-handler]
@@ -11,642 +13,954 @@
             [frontend.handler.search :as search-handler]
             [frontend.handler.ui :as ui-handler]
             [frontend.handler.plugin :as plugin-handler]
+            [frontend.handler.export :as export-handler]
+            [frontend.handler.whiteboard :as whiteboard-handler]
+            [frontend.handler.plugin-config :as plugin-config-handler]
+            [frontend.handler.window :as window-handler]
+            [frontend.modules.editor.undo-redo :as undo-redo]
+            [frontend.dicts :as dicts]
             [frontend.modules.shortcut.before :as m]
             [frontend.state :as state]
             [frontend.util :refer [mac?] :as util]
             [frontend.commands :as commands]
+            [frontend.config :as config]
+            [electron.ipc :as ipc]
+            [promesa.core :as p]
+            [clojure.data :as data]
             [medley.core :as medley]))
 
-;; Note – when you change this file, you will need to do a hard reset.
-;; The commands are registered when the Clojurescript code runs for the fir
-(defonce all-default-keyboard-shortcuts
-  {:date-picker/complete         {:desc    "Date picker: Choose selected day"
-                                  :binding "enter"
-                                  :fn      ui-handler/shortcut-complete}
+(defn- search
+  [mode]
+  (editor-handler/escape-editing false)
+  (route-handler/go-to-search! mode))
 
-   :date-picker/prev-day         {:desc    "Date picker: Select previous day"
-                                  :binding "left"
-                                  :fn      ui-handler/shortcut-prev-day}
+;; TODO: Namespace all-default-keyboard-shortcuts keys with `:command` e.g.
+;; `:command.date-picker/complete`. They are namespaced in translation but
+;; almost everywhere else they are not which could cause needless conflicts
+;; with other config keys
 
-   :date-picker/next-day         {:desc    "Date picker: Select next day"
-                                  :binding "right"
-                                  :fn      ui-handler/shortcut-next-day}
+;; To add a new entry to this map, first add it here and then a description for
+;; it under :commands keys of frontend.dicts.en/dicts
+;; A shortcut is a map with the following keys:
+;;  * :binding - A string representing a keybinding. Avoid using single letter
+;;    shortcuts to allow chords that start with those characters
+;;  * :fn - Fn or a qualified keyword that represents a fn
+;;  * :inactive - Optional boolean to disable a shortcut for certain conditions
+;;    e.g. a given platform or feature condition
+(def ^:large-vars/data-var all-built-in-keyboard-shortcuts
+  ;; BUG: Actually, "enter" is registered by mixin behind a "when inputing" guard
+  ;; So this setting item does not cover all cases.
+  ;; See-also: frontend.components.datetime/time-repeater
+  {:date-picker/complete                    {:binding "enter"
+                                             :fn      ui-handler/shortcut-complete}
 
-   :date-picker/prev-week        {:desc    "Date picker: Select previous week"
-                                  :binding "up"
-                                  :fn      ui-handler/shortcut-prev-week}
+   :date-picker/prev-day                    {:binding "left"
+                                             :fn      ui-handler/shortcut-prev-day}
 
-   :date-picker/next-week        {:desc    "Date picker: Select next week"
-                                  :binding "down"
-                                  :fn      ui-handler/shortcut-next-week}
+   :date-picker/next-day                    {:binding "right"
+                                             :fn      ui-handler/shortcut-next-day}
 
-   :pdf/previous-page            {:desc    "Previous page of current pdf doc"
-                                  :binding "alt+p"
-                                  :fn      pdf-utils/prev-page}
+   :date-picker/prev-week                   {:binding ["up" "ctrl+p"]
+                                             :fn      ui-handler/shortcut-prev-week}
 
-   :pdf/next-page                {:desc    "Next page of current pdf doc"
-                                  :binding "alt+n"
-                                  :fn      pdf-utils/next-page}
+   :date-picker/next-week                   {:binding ["down" "ctrl+n"]
+                                             :fn      ui-handler/shortcut-next-week}
 
-   :auto-complete/complete       {:desc    "Auto-complete: Choose selected item"
-                                  :binding "enter"
-                                  :fn      ui-handler/auto-complete-complete}
+   :pdf/previous-page                       {:binding "alt+p"
+                                             :fn      pdf-utils/prev-page}
 
-   :auto-complete/prev           {:desc    "Auto-complete: Select previous item"
-                                  :binding "up"
-                                  :fn      ui-handler/auto-complete-prev}
+   :pdf/next-page                           {:binding "alt+n"
+                                             :fn      pdf-utils/next-page}
 
-   :auto-complete/next           {:desc    "Auto-complete: Select next item"
-                                  :binding "down"
-                                  :fn      ui-handler/auto-complete-next}
+   :pdf/close                               {:binding "alt+x"
+                                             :fn      #(state/set-state! :pdf/current nil)}
 
-   :auto-complete/shift-complete {:desc    "Auto-complete: Open selected item in sidebar"
-                                  :binding "shift+enter"
-                                  :fn      ui-handler/auto-complete-shift-complete}
+   :pdf/find                                {:binding "alt+f"
+                                             :fn      pdf-utils/open-finder}
 
-   :cards/toggle-answers         {:desc    "Cards: show/hide answers/clozes"
-                                  :binding "s"
-                                  :fn      srs/toggle-answers}
+   :whiteboard/select                       {:binding ["1" "w s"]
+                                             :fn      #(.selectTool ^js (state/active-tldraw-app) "select")}
 
-   :cards/next-card              {:desc    "Cards: next card"
-                                  :binding "n"
-                                  :fn      srs/next-card}
+   :whiteboard/pan                          {:binding ["2" "w p"]
+                                             :fn      #(.selectTool ^js (state/active-tldraw-app) "move")}
 
-   :cards/forgotten              {:desc    "Cards: forgotten"
-                                  :binding "f"
-                                  :fn      srs/forgotten}
+   :whiteboard/portal                       {:binding ["3" "w b"]
+                                             :fn      #(.selectTool ^js (state/active-tldraw-app) "logseq-portal")}
 
-   :cards/remembered             {:desc    "Cards: remembered"
-                                  :binding "r"
-                                  :fn      srs/remembered}
+   :whiteboard/pencil                       {:binding ["4" "w d"]
+                                             :fn      #(.selectTool ^js (state/active-tldraw-app) "pencil")}
 
-   :cards/recall                 {:desc    "Cards: take a while to recall"
-                                  :binding "t"
-                                  :fn      srs/recall}
+   :whiteboard/highlighter                  {:binding ["5" "w h"]
+                                             :fn      #(.selectTool ^js (state/active-tldraw-app) "highlighter")}
 
-   :editor/escape-editing        {:desc    "Escape editing (remap to ctrl+open-square-bracket for example)"
-                                  :binding false
-                                  :fn      (fn [_ _] (editor-handler/escape-editing))}
+   :whiteboard/eraser                       {:binding ["6" "w e"]
+                                             :fn      #(.selectTool ^js (state/active-tldraw-app) "erase")}
 
-   :editor/backspace             {:desc    "Backspace / Delete backwards"
-                                  :binding "backspace"
-                                  :fn      editor-handler/editor-backspace}
+   :whiteboard/connector                    {:binding ["7" "w c"]
+                                             :fn      #(.selectTool ^js (state/active-tldraw-app) "line")}
 
-   :editor/delete                {:desc    "Delete / Delete forwards"
-                                  :binding "delete"
-                                  :fn      editor-handler/editor-delete}
+   :whiteboard/text                         {:binding ["8" "w t"]
+                                             :fn      #(.selectTool ^js (state/active-tldraw-app) "text")}
 
-   :editor/new-block             {:desc    "Create new block"
-                                  :binding "enter"
-                                  :fn      editor-handler/keydown-new-block-handler}
+   :whiteboard/rectangle                    {:binding ["9" "w r"]
+                                             :fn      #(.selectTool ^js (state/active-tldraw-app) "box")}
 
-   :editor/new-line              {:desc    "New line in current block"
-                                  :binding "shift+enter"
-                                  :fn      editor-handler/keydown-new-line-handler}
+   :whiteboard/ellipse                      {:binding ["o" "w o"]
+                                             :fn      #(.selectTool ^js (state/active-tldraw-app) "ellipse")}
 
-   :editor/follow-link           {:desc    "Follow link under cursor"
-                                  :binding "mod+o"
-                                  :fn      editor-handler/follow-link-under-cursor!}
+   :whiteboard/reset-zoom                   {:binding "shift+0"
+                                             :fn      #(.resetZoom (.-api ^js (state/active-tldraw-app)))}
 
-   :editor/open-link-in-sidebar  {:desc    "Open link in sidebar"
-                                  :binding "mod+shift+o"
-                                  :fn      editor-handler/open-link-in-sidebar!}
+   :whiteboard/zoom-to-fit                  {:binding "shift+1"
+                                             :fn      #(.zoomToFit (.-api ^js (state/active-tldraw-app)))}
 
-   :editor/bold                  {:desc    "Bold"
-                                  :binding "mod+b"
-                                  :fn      editor-handler/bold-format!}
+   :whiteboard/zoom-to-selection            {:binding "shift+2"
+                                             :fn      #(.zoomToSelection (.-api ^js (state/active-tldraw-app)))}
 
-   :editor/italics               {:desc    "Italics"
-                                  :binding "mod+i"
-                                  :fn      editor-handler/italics-format!}
+   :whiteboard/zoom-out                     {:binding "shift+dash"
+                                             :fn      #(.zoomOut (.-api ^js (state/active-tldraw-app)) false)}
 
-   :editor/highlight             {:desc    "Highlight"
-                                  :binding "mod+shift+h"
-                                  :fn      editor-handler/highlight-format!}
+   :whiteboard/zoom-in                      {:binding "shift+equals"
+                                             :fn      #(.zoomIn (.-api ^js (state/active-tldraw-app)) false)}
 
-   :editor/strike-through        {:desc    "Strikethrough"
-                                  :binding "mod+shift+s"
-                                  :fn      editor-handler/strike-through-format!}
+   :whiteboard/send-backward                {:binding "open-square-bracket"
+                                             :fn      #(.sendBackward ^js (state/active-tldraw-app))}
 
-   :editor/clear-block           {:desc    "Delete entire block content"
-                                  :binding (if mac? "ctrl+l" "alt+l")
-                                  :fn      editor-handler/clear-block-content!}
+   :whiteboard/send-to-back                 {:binding "shift+open-square-bracket"
+                                             :fn      #(.sendToBack ^js (state/active-tldraw-app))}
 
-   :editor/kill-line-before      {:desc    "Delete line before cursor position"
-                                  :binding (if mac? "ctrl+u" "alt+u")
-                                  :fn      editor-handler/kill-line-before!}
+   :whiteboard/bring-forward                {:binding "close-square-bracket"
+                                             :fn      #(.bringForward ^js (state/active-tldraw-app))}
 
-   :editor/kill-line-after       {:desc    "Delete line after cursor position"
-                                  :binding (if mac? false "alt+k")
-                                  :fn      editor-handler/kill-line-after!}
+   :whiteboard/bring-to-front               {:binding "shift+close-square-bracket"
+                                             :fn      #(.bringToFront ^js (state/active-tldraw-app))}
 
-   :editor/beginning-of-block    {:desc    "Move cursor to the beginning of a block"
-                                  :binding (if mac? false "alt+a")
-                                  :fn      editor-handler/beginning-of-block}
+   :whiteboard/lock                         {:binding "mod+l"
+                                             :fn      #(.setLocked ^js (state/active-tldraw-app) true)}
 
-   :editor/end-of-block          {:desc    "Move cursor to the end of a block"
-                                  :binding (if mac? false "alt+e")
-                                  :fn      editor-handler/end-of-block}
+   :whiteboard/unlock                       {:binding "mod+shift+l"
+                                             :fn      #(.setLocked ^js (state/active-tldraw-app) false)}
 
-   :editor/forward-word          {:desc    "Move cursor forward a word"
-                                  :binding (if mac? "ctrl+shift+f" "alt+f")
-                                  :fn      editor-handler/cursor-forward-word}
+   :whiteboard/group                        {:binding "mod+g"
+                                             :fn      #(.doGroup (.-api ^js (state/active-tldraw-app)))}
 
-   :editor/backward-word         {:desc    "Move cursor backward a word"
-                                  :binding (if mac? "ctrl+shift+b" "alt+b")
-                                  :fn      editor-handler/cursor-backward-word}
+   :whiteboard/ungroup                      {:binding "mod+shift+g"
+                                             :fn      #(.unGroup (.-api ^js (state/active-tldraw-app)))}
 
-   :editor/forward-kill-word     {:desc    "Delete a word forwards"
-                                  :binding (if mac? "ctrl+w" "alt+d")
-                                  :fn      editor-handler/forward-kill-word}
+   :whiteboard/toggle-grid                  {:binding "t g"
+                                             :fn      #(.toggleGrid (.-api ^js (state/active-tldraw-app)))}
 
-   :editor/backward-kill-word    {:desc    "Delete a word backwards"
-                                  :binding (if mac? false "alt+w")
-                                  :fn      editor-handler/backward-kill-word}
+   :whiteboard/clone-right                  {:binding (if mac? "ctrl+shift+right" "alt+right")
+                                             :fn      #(.clone (.-api ^js (state/active-tldraw-app)) "right")}
 
-   :editor/replace-block-reference-at-point {:desc    "Replace block reference with its content at point"
-                                             :binding "mod+shift+r"
+   :whiteboard/clone-left                   {:binding (if mac? "ctrl+shift+left" "alt+left")
+                                             :fn      #(.clone (.-api ^js (state/active-tldraw-app)) "left")}
+
+   :whiteboard/clone-up                     {:binding (if mac? "ctrl+shift+up" "alt+up")
+                                             :fn      #(.clone (.-api ^js (state/active-tldraw-app)) "up")}
+
+   :whiteboard/clone-down                   {:binding (if mac? "ctrl+shift+down" "alt+down")
+                                             :fn      #(.clone (.-api ^js (state/active-tldraw-app)) "down")}
+
+   :auto-complete/complete                  {:binding "enter"
+                                             :fn      ui-handler/auto-complete-complete}
+
+   :auto-complete/prev                      {:binding ["up" "ctrl+p"]
+                                             :fn      ui-handler/auto-complete-prev}
+
+   :auto-complete/next                      {:binding ["down" "ctrl+n"]
+                                             :fn      ui-handler/auto-complete-next}
+
+   :auto-complete/shift-complete            {:binding "shift+enter"
+                                             :fn      ui-handler/auto-complete-shift-complete}
+
+   :auto-complete/open-link                 {:binding "mod+o"
+                                             :fn      ui-handler/auto-complete-open-link}
+
+   :cards/toggle-answers                    {:binding "s"
+                                             :fn      srs/toggle-answers}
+
+   :cards/next-card                         {:binding "n"
+                                             :fn      srs/next-card}
+
+   :cards/forgotten                         {:binding "f"
+                                             :fn      srs/forgotten}
+
+   :cards/remembered                        {:binding "r"
+                                             :fn      srs/remembered}
+
+   :cards/recall                            {:binding "t"
+                                             :fn      srs/recall}
+
+   :editor/escape-editing                   {:binding []
+                                             :fn      (fn [_ _]
+                                                        (editor-handler/escape-editing))}
+
+   :editor/backspace                        {:binding "backspace"
+                                             :fn      editor-handler/editor-backspace}
+
+   :editor/delete                           {:binding "delete"
+                                             :fn      editor-handler/editor-delete}
+
+   :editor/new-block                        {:binding "enter"
+                                             :fn      editor-handler/keydown-new-block-handler}
+
+   :editor/new-line                         {:binding "shift+enter"
+                                             :fn      editor-handler/keydown-new-line-handler}
+
+   :editor/new-whiteboard                   {:binding "n w"
+                                             :fn      #(whiteboard-handler/create-new-whiteboard-and-redirect!)}
+
+   :editor/follow-link                      {:binding "mod+o"
+                                             :fn      editor-handler/follow-link-under-cursor!}
+
+   :editor/open-link-in-sidebar             {:binding "mod+shift+o"
+                                             :fn      editor-handler/open-link-in-sidebar!}
+
+   :editor/bold                             {:binding "mod+b"
+                                             :fn      editor-handler/bold-format!}
+
+   :editor/italics                          {:binding "mod+i"
+                                             :fn      editor-handler/italics-format!}
+
+   :editor/highlight                        {:binding "mod+shift+h"
+                                             :fn      editor-handler/highlight-format!}
+
+   :editor/strike-through                   {:binding "mod+shift+s"
+                                             :fn      editor-handler/strike-through-format!}
+
+   :editor/clear-block                      {:binding (if mac? "ctrl+l" "alt+l")
+                                             :fn      editor-handler/clear-block-content!}
+
+   :editor/kill-line-before                 {:binding (if mac? "ctrl+u" "alt+u")
+                                             :fn      editor-handler/kill-line-before!}
+
+   :editor/kill-line-after                  {:binding (if mac? false "alt+k")
+                                             :fn      editor-handler/kill-line-after!}
+
+   :editor/beginning-of-block               {:binding (if mac? false "alt+a")
+                                             :fn      editor-handler/beginning-of-block}
+
+   :editor/end-of-block                     {:binding (if mac? false "alt+e")
+                                             :fn      editor-handler/end-of-block}
+
+   :editor/forward-word                     {:binding (if mac? "ctrl+shift+f" "alt+f")
+                                             :fn      editor-handler/cursor-forward-word}
+
+   :editor/backward-word                    {:binding (if mac? "ctrl+shift+b" "alt+b")
+                                             :fn      editor-handler/cursor-backward-word}
+
+   :editor/forward-kill-word                {:binding (if mac? "ctrl+w" "alt+d")
+                                             :fn      editor-handler/forward-kill-word}
+
+   :editor/backward-kill-word               {:binding (if mac? false "alt+w")
+                                             :fn      editor-handler/backward-kill-word}
+
+   :editor/replace-block-reference-at-point {:binding "mod+shift+r"
                                              :fn      editor-handler/replace-block-reference-with-content-at-point}
+   :editor/copy-embed                       {:binding "mod+e"
+                                             :fn      editor-handler/copy-current-block-embed}
 
-   :editor/paste-text-in-one-block-at-point {:desc    "Paste text into one block at point"
-                                             :binding "mod+shift+v"
-                                             :fn      editor-handler/paste-text-in-one-block-at-point}
+   :editor/paste-text-in-one-block-at-point {:binding "mod+shift+v"
+                                             :fn      paste-handler/editor-on-paste-raw!}
 
-   :editor/insert-youtube-timestamp         {:desc    "Insert youtube timestamp"
-                                             :binding "mod+shift+y"
+   :editor/insert-youtube-timestamp         {:binding "mod+shift+y"
                                              :fn      commands/insert-youtube-timestamp}
 
-   :editor/cycle-todo              {:desc    "Rotate the TODO state of the current item"
-                                    :binding "mod+enter"
-                                    :fn      editor-handler/cycle-todo!}
+   :editor/cycle-todo                       {:binding "mod+enter"
+                                             :fn      editor-handler/cycle-todo!}
 
-   :editor/up                      {:desc    "Move cursor up / Select up"
-                                    :binding "up"
-                                    :fn      (editor-handler/shortcut-up-down :up)}
+   :editor/up                               {:binding ["up" "ctrl+p"]
+                                             :fn      (editor-handler/shortcut-up-down :up)}
 
-   :editor/down                    {:desc    "Move cursor down / Select down"
-                                    :binding "down"
-                                    :fn      (editor-handler/shortcut-up-down :down)}
+   :editor/down                             {:binding ["down" "ctrl+n"]
+                                             :fn      (editor-handler/shortcut-up-down :down)}
 
-   :editor/left                    {:desc    "Move cursor left / Open selected block at beginning"
-                                    :binding "left"
-                                    :fn      (editor-handler/shortcut-left-right :left)}
+   :editor/left                             {:binding "left"
+                                             :fn      (editor-handler/shortcut-left-right :left)}
 
-   :editor/right                   {:desc    "Move cursor right / Open selected block at end"
-                                    :binding "right"
-                                    :fn      (editor-handler/shortcut-left-right :right)}
+   :editor/right                            {:binding "right"
+                                             :fn      (editor-handler/shortcut-left-right :right)}
 
-   :editor/move-block-up           {:desc    "Move block up"
-                                    :binding (if mac? "mod+shift+up" "alt+shift+up")
-                                    :fn      (editor-handler/move-up-down true)}
+   :editor/move-block-up                    {:binding (if mac? "mod+shift+up" "alt+shift+up")
+                                             :fn      (editor-handler/move-up-down true)}
 
-   :editor/move-block-down         {:desc    "Move block down"
-                                    :binding (if mac? "mod+shift+down" "alt+shift+down")
-                                    :fn      (editor-handler/move-up-down false)}
+   :editor/move-block-down                  {:binding (if mac? "mod+shift+down" "alt+shift+down")
+                                             :fn      (editor-handler/move-up-down false)}
 
    ;; FIXME: add open edit in non-selection mode
-   :editor/open-edit               {:desc    "Edit selected block"
-                                    :binding "enter"
-                                    :fn      (partial editor-handler/open-selected-block! :right)}
+   :editor/open-edit                        {:binding "enter"
+                                             :fn      (partial editor-handler/open-selected-block! :right)}
 
-   :editor/select-block-up         {:desc    "Select block above"
-                                    :binding "shift+up"
-                                    :fn      (editor-handler/on-select-block :up)}
+   :editor/select-block-up                  {:binding "alt+up"
+                                             :fn      (editor-handler/on-select-block :up)}
 
-   :editor/select-block-down       {:desc    "Select block below"
-                                    :binding "shift+down"
-                                    :fn      (editor-handler/on-select-block :down)}
+   :editor/select-block-down                {:binding "alt+down"
+                                             :fn      (editor-handler/on-select-block :down)}
 
-   :editor/delete-selection        {:desc    "Delete selected blocks"
-                                    :binding ["backspace" "delete"]
-                                    :fn      editor-handler/delete-selection}
+   :editor/select-up                        {:binding "shift+up"
+                                             :fn      (editor-handler/shortcut-select-up-down :up)}
 
-   :editor/expand-block-children   {:desc    "Expand"
-                                    :binding "mod+down"
-                                    :fn      editor-handler/expand!}
+   :editor/select-down                      {:binding "shift+down"
+                                             :fn      (editor-handler/shortcut-select-up-down :down)}
 
-   :editor/collapse-block-children {:desc    "Collapse"
-                                    :binding "mod+up"
-                                    :fn      editor-handler/collapse!}
+   :editor/delete-selection                 {:binding ["backspace" "delete"]
+                                             :fn      editor-handler/delete-selection}
 
-   :editor/indent                  {:desc    "Indent block"
-                                    :binding "tab"
-                                    :fn      (editor-handler/keydown-tab-handler :right)}
+   :editor/expand-block-children            {:binding "mod+down"
+                                             :fn      editor-handler/expand!}
 
-   :editor/outdent                 {:desc    "Outdent block"
-                                    :binding "shift+tab"
-                                    :fn      (editor-handler/keydown-tab-handler :left)}
+   :editor/collapse-block-children          {:binding "mod+up"
+                                             :fn      editor-handler/collapse!}
 
-   :editor/copy                    {:desc    "Copy (copies either selection, or block reference)"
-                                    :binding "mod+c"
-                                    :fn      editor-handler/shortcut-copy}
+   :editor/toggle-block-children            {:binding "mod+;"
+                                             :fn      editor-handler/toggle-collapse!}
 
-   :editor/cut                     {:desc    "Cut"
-                                    :binding "mod+x"
-                                    :fn      editor-handler/shortcut-cut}
+   :editor/indent                           {:binding "tab"
+                                             :fn      (editor-handler/keydown-tab-handler :right)}
 
-   :editor/undo                    {:desc    "Undo"
-                                    :binding "mod+z"
-                                    :fn      history/undo!}
+   :editor/outdent                          {:binding "shift+tab"
+                                             :fn      (editor-handler/keydown-tab-handler :left)}
 
-   :editor/redo                    {:desc    "Redo"
-                                    :binding ["shift+mod+z" "mod+y"]
-                                    :fn      history/redo!}
+   :editor/copy                             {:binding "mod+c"
+                                             :fn      editor-handler/shortcut-copy}
 
-   :editor/insert-link             {:desc    "HTML Link"
-                                    :binding "mod+l"
-                                    :fn      editor-handler/html-link-format!}
+   :editor/copy-text                        {:binding "mod+shift+c"
+                                             :fn      editor-handler/shortcut-copy-text}
 
-   :editor/select-all-blocks       {:desc    "Select all blocks"
-                                    :binding "mod+shift+a"
-                                    :fn      editor-handler/select-all-blocks!}
+   :editor/cut                              {:binding "mod+x"
+                                             :fn      editor-handler/shortcut-cut}
 
-   :editor/zoom-in                 {:desc    "Zoom in editing block / Forwards otherwise"
-                                    :binding (if mac? "mod+." "alt+right")
-                                    :fn      editor-handler/zoom-in!}
+   :editor/undo                             {:binding "mod+z"
+                                             :fn      history/undo!}
 
-   :editor/zoom-out                {:desc    "Zoom out editing block / Backwards otherwise"
-                                    :binding (if mac? "mod+," "alt+left")
-                                    :fn      editor-handler/zoom-out!}
+   :editor/redo                             {:binding ["mod+shift+z" "mod+y"]
+                                             :fn      history/redo!}
 
-   :ui/toggle-brackets             {:desc    "Toggle whether to display brackets"
-                                    :binding "mod+c mod+b"
-                                    :fn      config-handler/toggle-ui-show-brackets!}
+   :editor/insert-link                      {:binding "mod+l"
+                                             :fn      #(editor-handler/html-link-format!)}
 
-   :go/search-in-page              {:desc    "Search in the current page"
-                                    :binding "mod+shift+k"
-                                    :fn      #(route-handler/go-to-search! :page)}
+   :editor/select-all-blocks                {:binding "mod+shift+a"
+                                             :fn      editor-handler/select-all-blocks!}
 
-   :go/search                      {:desc    "Full text search"
-                                    :binding "mod+k"
-                                    :fn      #(route-handler/go-to-search! :global)}
+   :editor/select-parent                    {:binding "mod+a"
+                                             :fn      editor-handler/select-parent}
 
-   :go/journals                    {:desc    "Jump to journals"
-                                    :binding (if mac? "mod+j" "alt+j")
-                                    :fn      route-handler/go-to-journals!}
+   :editor/zoom-in                          {:binding (if mac? "mod+." "alt+right")
+                                             :fn      editor-handler/zoom-in!}
 
-   :go/backward                    {:desc    "Backwards"
-                                    :binding "mod+open-square-bracket"
-                                    :fn      (fn [_] (js/window.history.back))}
+   :editor/zoom-out                         {:binding (if mac? "mod+," "alt+left")
+                                             :fn      editor-handler/zoom-out!}
 
-   :go/forward                     {:desc    "Forwards"
-                                    :binding "mod+close-square-bracket"
-                                    :fn      (fn [_] (js/window.history.forward))}
+   :editor/toggle-undo-redo-mode            {:binding []
+                                             :fn      undo-redo/toggle-undo-redo-mode!}
 
-   :search/re-index                {:desc    "Rebuild search index"
-                                    :binding "mod+c mod+s"
-                                    :fn      search-handler/rebuild-indices!}
+   :editor/toggle-number-list               {:binding "t n"
+                                             :fn      #(state/pub-event! [:editor/toggle-own-number-list (state/get-selection-block-ids)])}
 
-   :sidebar/open-today-page        {:desc    "Open today's page in the right sidebar"
-                                    :binding (if mac? "mod+shift+j" "alt+shift+j")
-                                    :fn      page-handler/open-today-in-sidebar}
+   :ui/toggle-brackets                      {:binding "mod+c mod+b"
+                                             :fn      config-handler/toggle-ui-show-brackets!}
 
-   :sidebar/clear                  {:desc    "Clear all in the right sidebar"
-                                    :binding "mod+c mod+c"
-                                    :fn      #(do
-                                                (state/clear-sidebar-blocks!)
-                                                (state/hide-right-sidebar!))}
+   :go/search                               {:binding "mod+k"
+                                             :fn      #(search :global)}
+   :command-palette/toggle                  {:binding "mod+shift+p"
+                                             :fn      #(search :commands)}
+   :go/search-in-page                       {:binding "mod+shift+k"
+                                             :fn      #(search :current-page)}
 
-   :misc/copy                      {:binding "mod+c"
-                                    :fn      (fn [] (js/document.execCommand "copy"))}
 
-   :command-palette/toggle         {:desc    "Toggle command palette"
-                                    :binding "mod+shift+p"
-                                    :fn      (fn [] (state/toggle! :ui/command-palette-open?))}
+   :go/electron-find-in-page                {:binding  "mod+f"
+                                             :inactive (not (util/electron?))
+                                             :fn       #(search-handler/open-find-in-page!)}
 
-   :command/run                    {:desc    "Run git command"
-                                    :binding "mod+shift+1"
-                                    :fn      #(state/pub-event! [:command/run])}
+   :go/electron-jump-to-the-next            {:binding  ["enter" "mod+g"]
+                                             :inactive (not (util/electron?))
+                                             :fn       #(search-handler/loop-find-in-page! false)}
 
-   :go/home                        {:desc    "Go to home"
-                                    :binding "g h"
-                                    :fn      #(route-handler/redirect-to-home!)}
+   :go/electron-jump-to-the-previous        {:binding  ["shift+enter" "mod+shift+g"]
+                                             :inactive (not (util/electron?))
+                                             :fn       #(search-handler/loop-find-in-page! true)}
 
-   :go/keyboard-shortcuts          {:desc    "Go to keyboard shortcuts"
-                                    :binding "g s"
-                                    :fn      #(route-handler/redirect! {:to :shortcut-setting})}
+   :go/journals                             {:binding "g j"
+                                             :fn      route-handler/go-to-journals!}
 
-   :go/tomorrow                    {:desc    "Go to tomorrow"
-                                    :binding "g t"
-                                    :fn      journal-handler/go-to-tomorrow!}
+   :go/backward                             {:binding "mod+open-square-bracket"
+                                             :fn      (fn [_] (js/window.history.back))}
 
-   :go/next-journal                {:desc    "Go to next journal"
-                                    :binding "g n"
-                                    :fn      journal-handler/go-to-next-journal!}
+   :go/forward                              {:binding "mod+close-square-bracket"
+                                             :fn      (fn [_] (js/window.history.forward))}
 
-   :go/prev-journal                {:desc    "Go to previous journal"
-                                    :binding "g p"
-                                    :fn      journal-handler/go-to-prev-journal!}
+   :search/re-index                         {:binding "mod+c mod+s"
+                                             :fn      (fn [_] (search-handler/rebuild-indices! true))}
 
-   :ui/toggle-document-mode        {:desc    "Toggle document mode"
-                                    :binding "t d"
-                                    :fn      state/toggle-document-mode!}
+   :sidebar/open-today-page                 {:binding (if mac? "mod+shift+j" "alt+shift+j")
+                                             :fn      page-handler/open-today-in-sidebar}
 
-   :ui/toggle-settings              {:desc    "Toggle settings"
-                                     :binding (if mac? "t s" ["t s" "mod+,"])
-                                     :fn      ui-handler/toggle-settings-modal!}
+   :sidebar/close-top                       {:binding "c t"
+                                             :fn      #(state/sidebar-remove-block! 0)}
 
-   :ui/toggle-right-sidebar         {:desc    "Toggle right sidebar"
-                                     :binding "t r"
-                                     :fn      ui-handler/toggle-right-sidebar!}
+   :sidebar/clear                           {:binding "mod+c mod+c"
+                                             :fn      #(do
+                                                         (state/clear-sidebar-blocks!)
+                                                         (state/hide-right-sidebar!))}
 
-   :ui/toggle-left-sidebar          {:desc    "Toggle left sidebar"
-                                     :binding "t l"
-                                     :fn      ui-handler/toggle-left-sidebar!}
+   :misc/copy                               {:binding "mod+c"
+                                             :fn      (fn [] (js/document.execCommand "copy"))}
 
-   :ui/toggle-help                  {:desc    "Toggle help"
-                                     :binding "shift+/"
-                                     :fn      ui-handler/toggle-help!}
 
-   :ui/toggle-theme                 {:desc    "Toggle between dark/light theme"
-                                     :binding "t t"
-                                     :fn      state/toggle-theme!}
+   :graph/export-as-html                    {:fn      #(export-handler/download-repo-as-html!
+                                                        (state/get-current-repo))
+                                             :binding []}
 
-   :ui/toggle-contents              {:desc    "Toggle Favorites in sidebar"
-                                     :binding "t f"
-                                     :fn      ui-handler/toggle-contents!}
+   :graph/open                              {:fn      #(do
+                                                         (editor-handler/escape-editing)
+                                                         (state/set-state! :ui/open-select :graph-open))
+                                             :binding "alt+shift+g"}
 
-   :editor/open-file-in-default-app {:desc    "Open file in default app"
-                                     :binding "o f"
-                                     :fn      page-handler/open-file-in-default-app}
+   :graph/remove                            {:fn      #(do
+                                                         (editor-handler/escape-editing)
+                                                         (state/set-state! :ui/open-select :graph-remove))
+                                             :binding []}
 
-   :editor/open-file-in-directory   {:desc    "Open file in parent directory"
-                                     :binding "o d"
-                                     :fn      page-handler/open-file-in-directory}
+   :graph/add                               {:fn      (fn [] (route-handler/redirect! {:to :repo-add}))
+                                             :binding []}
 
-   :ui/toggle-wide-mode             {:desc    "Toggle wide mode"
-                                     :binding "t w"
-                                     :fn      ui-handler/toggle-wide-mode!}
+   :graph/save                              {:fn      #(state/pub-event! [:graph/save])
+                                             :binding []}
 
-   :ui/select-theme-color           {:desc    "Select available theme colors"
-                                     :binding "t i"
-                                     :fn      plugin-handler/show-themes-modal!}
+   :graph/re-index                          {:fn      (fn []
+                                                        (p/let [multiple-windows? (ipc/ipc "graphHasMultipleWindows" (state/get-current-repo))]
+                                                          (state/pub-event! [:graph/ask-for-re-index (atom multiple-windows?) nil])))
+                                             :binding []}
 
-   :ui/goto-plugins                 {:desc    "Go to plugins dashboard"
-                                     :binding "t p"
-                                     :fn      plugin-handler/goto-plugins-dashboard!}
+   :command/run                             {:binding  "mod+shift+1"
+                                             :inactive (not (util/electron?))
+                                             :fn       #(do
+                                                          (editor-handler/escape-editing)
+                                                          (state/pub-event! [:command/run]))}
 
-   :editor/toggle-open-blocks       {:desc    "Toggle open blocks (collapse or expand all blocks)"
-                                     :binding "t o"
-                                     :fn      editor-handler/toggle-open!}
+   :go/home                                 {:binding "g h"
+                                             :fn      #(route-handler/redirect-to-home!)}
 
-   :ui/toggle-cards                 {:desc    "Toggle cards"
-                                     :binding "t c"
-                                     :fn      ui-handler/toggle-cards!}
-  ;; :ui/toggle-between-page-and-file route-handler/toggle-between-page-and-file!
+   :go/all-pages                            {:binding "g a"
+                                             :fn      route-handler/redirect-to-all-pages!}
 
-   :git/commit                      {:desc    "Git commit message"
-                                     :binding "c"
-                                     :fn      commit/show-commit-modal!}})
+   :go/graph-view                           {:binding "g g"
+                                             :fn      route-handler/redirect-to-graph-view!}
 
-(defn build-category-map [symbols]
-  (reduce into {}
-          (map (fn [sym] {sym (get all-default-keyboard-shortcuts sym)}) symbols)))
+   :go/all-graphs                           {:binding "g shift+g"
+                                             :fn      route-handler/redirect-to-all-graphs}
 
-(defonce config
+   :go/whiteboards                          {:binding "g w"
+                                             :fn      route-handler/redirect-to-whiteboard-dashboard!}
+
+   :go/keyboard-shortcuts                   {:binding "g s"
+                                             :fn      #(state/pub-event! [:modal/keymap])}
+
+   :go/tomorrow                             {:binding "g t"
+                                             :fn      journal-handler/go-to-tomorrow!}
+
+   :go/next-journal                         {:binding "g n"
+                                             :fn      journal-handler/go-to-next-journal!}
+
+   :go/prev-journal                         {:binding "g p"
+                                             :fn      journal-handler/go-to-prev-journal!}
+
+   :go/flashcards                           {:binding ["g f" "t c"]
+                                             :fn      ui-handler/toggle-cards!}
+
+   :ui/toggle-document-mode                 {:binding "t d"
+                                             :fn      state/toggle-document-mode!}
+
+   :ui/toggle-settings                      {:binding (if mac? ["t s" "mod+,"] "t s")
+                                             :fn      ui-handler/toggle-settings-modal!}
+
+   :ui/toggle-right-sidebar                 {:binding "t r"
+                                             :fn      ui-handler/toggle-right-sidebar!}
+
+   :ui/toggle-left-sidebar                  {:binding "t l"
+                                             :fn      state/toggle-left-sidebar!}
+
+   :ui/toggle-help                          {:binding "shift+/"
+                                             :fn      ui-handler/toggle-help!}
+
+   :ui/toggle-theme                         {:binding "t t"
+                                             :fn      state/toggle-theme!}
+
+   :ui/toggle-contents                      {:binding "alt+shift+c"
+                                             :fn      ui-handler/toggle-contents!}
+
+   :command/toggle-favorite                 {:binding "mod+shift+f"
+                                             :fn      page-handler/toggle-favorite!}
+
+   :editor/open-file-in-default-app         {:binding  "mod+d mod+a"
+                                             :inactive (not (util/electron?))
+                                             :fn       page-handler/open-file-in-default-app}
+
+   :editor/open-file-in-directory           {:binding  "mod+d mod+i"
+                                             :inactive (not (util/electron?))
+                                             :fn       page-handler/open-file-in-directory}
+
+   :editor/copy-current-file                {:binding  false
+                                             :inactive (not (util/electron?))
+                                             :fn       page-handler/copy-current-file}
+
+   :editor/copy-page-url                    {:binding  []
+                                             :inactive (not (util/electron?))
+                                             :fn       #(page-handler/copy-page-url)}
+
+   :window/close                            {:binding  "mod+w"
+                                             :inactive (not (util/electron?))
+                                             :fn       window-handler/close!}
+
+   :ui/toggle-wide-mode                     {:binding "t w"
+                                             :fn      ui-handler/toggle-wide-mode!}
+
+   :ui/select-theme-color                   {:binding "t i"
+                                             :fn      plugin-handler/show-themes-modal!}
+
+   :ui/goto-plugins                         {:binding  "t p"
+                                             :inactive (not config/lsp-enabled?)
+                                             :fn       plugin-handler/goto-plugins-dashboard!}
+
+   :ui/install-plugins-from-file            {:binding  false
+                                             :inactive (not (config/plugin-config-enabled?))
+                                             :fn       plugin-config-handler/open-replace-plugins-modal}
+
+   :ui/clear-all-notifications              {:binding []
+                                             :fn      :frontend.handler.notification/clear-all!}
+
+   :editor/toggle-open-blocks               {:binding "t o"
+                                             :fn      editor-handler/toggle-open!}
+
+   :ui/accent-color-reset                   {:binding "c o"
+                                             :fn      state/unset-color-accent!}
+
+   :ui/accent-colors-picker                 {:binding "c c"
+                                             :fn      #(state/pub-event! [:modal/toggle-accent-colors-modal])}
+
+   :git/commit                              {:binding  "mod+g c"
+                                             :inactive (not (util/electron?))
+                                             :fn       commit/show-commit-modal!}
+
+   :dev/show-block-data                     {:binding  []
+                                             :inactive (not (state/developer-mode?))
+                                             :fn       :frontend.handler.common.developer/show-block-data}
+
+   :dev/show-block-ast                      {:binding  []
+                                             :inactive (not (state/developer-mode?))
+                                             :fn       :frontend.handler.common.developer/show-block-ast}
+
+   :dev/show-page-data                      {:binding  []
+                                             :inactive (not (state/developer-mode?))
+                                             :fn       :frontend.handler.common.developer/show-page-data}
+
+   :dev/show-page-ast                       {:binding  []
+                                             :inactive (not (state/developer-mode?))
+                                             :fn       :frontend.handler.common.developer/show-page-ast}})
+
+(let [keyboard-commands
+      {::commands       (set (keys all-built-in-keyboard-shortcuts))
+       ::dicts/commands dicts/abbreviated-commands}]
+  (assert (= (::commands keyboard-commands) (::dicts/commands keyboard-commands))
+    (str "Keyboard commands must have an english label"
+      (data/diff (::commands keyboard-commands) (::commands keyboard-commands)))))
+
+(defn- resolve-fn
+  "Converts a keyword fn to the actual fn. The fn to be resolved needs to be
+  marked as ^:export for advanced mode"
+  [keyword-fn]
+  (fn []
+    (if-let [resolved-fn (some-> (find-ns-obj (namespace keyword-fn))
+                           (aget (munge (name keyword-fn))))]
+      (resolved-fn)
+      (throw (ex-info (str "Unable to resolve " keyword-fn " to a fn") {})))))
+
+(defn build-category-map [ks]
+  (->> (if (sequential? ks)
+         ks (let [{:keys [ns includes excludes]} ks]
+              (->> (keys all-built-in-keyboard-shortcuts)
+                (filter (fn [k]
+                          (and (or (and ns (keyword? k)
+                                     (contains? (->> (if (seqable? ns) (seq ns) [ns]) (map #(name %)) (set))
+                                       (namespace k)))
+                                 (and includes (contains? (set includes) k)))
+                            (if (not (seq excludes)) true (not (contains? (set excludes) k)))))))))
+    (select-keys all-built-in-keyboard-shortcuts)
+    (remove (comp :inactive val))
+    ;; Convert keyword fns to real fns
+    (map (fn [[k v]]
+           [k (if (keyword? (:fn v))
+                (assoc v :fn (resolve-fn (:fn v)))
+                v)]))
+    (into {})))
+
+;; This is the only var that should be publicly expose :fn functionality
+(defonce ^:large-vars/data-var *config
   (atom
-   {:shortcut.handler/date-picker
-    (build-category-map [:date-picker/complete
-                         :date-picker/prev-day
-                         :date-picker/next-day
-                         :date-picker/prev-week
-                         :date-picker/next-week])
+    {:shortcut.handler/date-picker
+     (build-category-map {:ns :date-picker})
 
-    :shortcut.handler/pdf
-    (-> (build-category-map [:pdf/previous-page
-                             :pdf/next-page])
-        (with-meta {:before m/enable-when-not-editing-mode!}))
+     :shortcut.handler/pdf
+     (-> (build-category-map {:ns :pdf})
+       (with-meta {:before m/enable-when-not-editing-mode!}))
 
-    :shortcut.handler/auto-complete
-    (build-category-map [:auto-complete/complete
-                         :auto-complete/prev
-                         :auto-complete/next
-                         :auto-complete/shift-complete])
+     :shortcut.handler/whiteboard
+     (-> (build-category-map {:ns :whiteboard})
+       (with-meta {:before m/enable-when-not-editing-mode!}))
 
-    :shortcut.handler/cards
-    (build-category-map [:cards/toggle-answers
-                         :cards/next-card
-                         :cards/forgotten
-                         :cards/remembered
-                         :cards/recall])
+     :shortcut.handler/auto-complete
+     (build-category-map {:ns :auto-complete})
 
-    :shortcut.handler/block-editing-only
-    (->
-     (build-category-map [:editor/escape-editing
-                          :editor/backspace
-                          :editor/delete
-                          :editor/new-block
-                          :editor/new-line
-                          :editor/follow-link
-                          :editor/open-link-in-sidebar
-                          :editor/bold
-                          :editor/italics
-                          :editor/highlight
-                          :editor/strike-through
-                          :editor/clear-block
-                          :editor/kill-line-before
-                          :editor/kill-line-after
-                          :editor/beginning-of-block
-                          :editor/end-of-block
-                          :editor/forward-word
-                          :editor/backward-word
-                          :editor/forward-kill-word
-                          :editor/backward-kill-word
-                          :editor/replace-block-reference-at-point
-                          :editor/paste-text-in-one-block-at-point
-                          :editor/insert-youtube-timestamp])
-     (with-meta {:before m/enable-when-editing-mode!}))
+     :shortcut.handler/cards
+     (-> (build-category-map {:ns :cards})
+       (with-meta {:before m/enable-when-not-editing-mode!}))
 
-    :shortcut.handler/editor-global
-    (->
-     (build-category-map [:editor/cycle-todo
-                          :editor/up
-                          :editor/down
-                          :editor/left
-                          :editor/right
-                          :editor/move-block-up
-                          :editor/move-block-down
-                          :editor/open-edit
-                          :editor/select-block-up
-                          :editor/select-block-down
-                          :editor/delete-selection
-                          :editor/expand-block-children
-                          :editor/collapse-block-children
-                          :editor/indent
-                          :editor/outdent
-                          :editor/copy
-                          :editor/cut
-                          :editor/undo
-                          :editor/redo])
-     (with-meta {:before m/enable-when-not-component-editing!}))
+     :shortcut.handler/block-editing-only
+     (-> (build-category-map
+           [:editor/escape-editing
+            :editor/backspace
+            :editor/delete
+            :editor/zoom-in
+            :editor/zoom-out
+            :editor/new-block
+            :editor/new-line
+            :editor/follow-link
+            :editor/open-link-in-sidebar
+            :editor/bold
+            :editor/italics
+            :editor/highlight
+            :editor/strike-through
+            :editor/clear-block
+            :editor/kill-line-before
+            :editor/kill-line-after
+            :editor/beginning-of-block
+            :editor/end-of-block
+            :editor/forward-word
+            :editor/backward-word
+            :editor/forward-kill-word
+            :editor/backward-kill-word
+            :editor/replace-block-reference-at-point
+            :editor/copy-embed
+            :editor/paste-text-in-one-block-at-point
+            :editor/insert-youtube-timestamp])
+       (with-meta {:before m/enable-when-editing-mode!}))
 
-    :shortcut.handler/global-prevent-default
-    (->
-     (build-category-map [:editor/insert-link
-                          :editor/select-all-blocks
-                          :editor/zoom-in
-                          :editor/zoom-out
-                          :ui/toggle-brackets
-                          :go/search-in-page
-                          :go/search
-                          :go/journals
-                          :go/backward
-                          :go/forward
-                          :search/re-index
-                          :sidebar/open-today-page
-                          :sidebar/clear])
-     (with-meta {:before m/prevent-default-behavior}))
+     :shortcut.handler/editor-global
+     (-> (build-category-map
+           [:graph/export-as-html
+            :graph/open
+            :graph/remove
+            :graph/add
+            :graph/save
+            :graph/re-index
+            :editor/cycle-todo
+            :editor/up
+            :editor/down
+            :editor/left
+            :editor/right
+            :editor/select-up
+            :editor/select-down
+            :editor/move-block-up
+            :editor/move-block-down
+            :editor/open-edit
+            :editor/select-block-up
+            :editor/select-block-down
+            :editor/select-parent
+            :editor/delete-selection
+            :editor/expand-block-children
+            :editor/collapse-block-children
+            :editor/toggle-block-children
+            :editor/indent
+            :editor/outdent
+            :editor/copy
+            :editor/copy-text
+            :editor/cut
+            :command/toggle-favorite])
+       (with-meta {:before m/enable-when-not-component-editing!}))
 
-    :shortcut.handler/misc
-    ;; always overrides the copy due to "mod+c mod+s"
-    {:misc/copy              (:misc/copy              all-default-keyboard-shortcuts)
-     :command-palette/toggle (:command-palette/toggle all-default-keyboard-shortcuts)}
+     :shortcut.handler/global-prevent-default
+     (-> (build-category-map
+           [:editor/insert-link
+            :editor/select-all-blocks
+            :editor/toggle-undo-redo-mode
+            :editor/toggle-number-list
+            :editor/undo
+            :editor/redo
+            :ui/toggle-brackets
+            :go/search
+            :go/search-in-page
+            :command-palette/toggle
+            :go/electron-find-in-page
+            :go/electron-jump-to-the-next
+            :go/electron-jump-to-the-previous
+            :go/backward
+            :go/forward
+            :search/re-index
+            :sidebar/open-today-page
+            :sidebar/clear
+            :command/run
+            :window/close])
+       (with-meta {:before m/prevent-default-behavior}))
 
-    :shortcut.handler/global-non-editing-only
-    (->
-     (build-category-map [:command/run
-                          :go/home
-                          :go/keyboard-shortcuts
-                          :go/tomorrow
-                          :go/next-journal
-                          :go/prev-journal
-                          :ui/toggle-document-mode
-                          :ui/toggle-settings
-                          :ui/toggle-right-sidebar
-                          :ui/toggle-left-sidebar
-                          :ui/toggle-help
-                          :ui/toggle-theme
-                          :ui/toggle-contents
-                          :editor/open-file-in-default-app
-                          :editor/open-file-in-directory
-                          :ui/toggle-wide-mode
-                          :ui/select-theme-color
-                          :ui/goto-plugins
-                          :editor/toggle-open-blocks
-                          :ui/toggle-cards
-                          :git/commit])
-     (with-meta {:before m/enable-when-not-editing-mode!}))}))
+     :shortcut.handler/global-non-editing-only
+     (-> (build-category-map
+           [:go/home
+            :go/journals
+            :go/all-pages
+            :go/flashcards
+            :go/graph-view
+            :go/all-graphs
+            :go/whiteboards
+            :go/keyboard-shortcuts
+            :go/tomorrow
+            :go/next-journal
+            :go/prev-journal
+            :ui/toggle-document-mode
+            :ui/toggle-settings
+            :ui/toggle-right-sidebar
+            :ui/toggle-left-sidebar
+            :ui/toggle-help
+            :ui/toggle-theme
+            :ui/toggle-contents
+            :editor/open-file-in-default-app
+            :editor/open-file-in-directory
+            :editor/copy-current-file
+            :editor/copy-page-url
+            :editor/new-whiteboard
+            :ui/toggle-wide-mode
+            :ui/select-theme-color
+            :ui/goto-plugins
+            :ui/install-plugins-from-file
+            :editor/toggle-open-blocks
+            :ui/clear-all-notifications
+            :git/commit
+            :sidebar/close-top
+            :dev/show-block-data
+            :dev/show-block-ast
+            :dev/show-page-data
+            :dev/show-page-ast
+            :ui/accent-colors-picker
+            :ui/accent-color-reset])
+       (with-meta {:before m/enable-when-not-editing-mode!}))
 
-;; Categories for docs purpose
-(def category
-  {:shortcut.category/basics
-   ^{:doc "Basics"}
-   [:editor/new-block
-    :editor/new-line
-    :editor/indent
-    :editor/outdent
-    :editor/select-all-blocks
-    :go/search
-    :go/search-in-page
-    :editor/undo
-    :editor/redo
-    :editor/copy
-    :editor/cut]
+     :shortcut.handler/misc
+     ;; always overrides the copy due to "mod+c mod+s"
+     {:misc/copy (:misc/copy all-built-in-keyboard-shortcuts)}}))
 
-   :shortcut.category/formatting
-   ^{:doc "Formatting"}
-   [:editor/bold
-    :editor/insert-link
-    :editor/italics
-    :editor/highlight]
+;; To add a new entry to this map, first add it here and then
+;; a description for it in frontend.dicts.en/dicts
+;; Full list of categories for docs purpose
+(defonce ^:large-vars/data-var *category
+  (atom
+    {:shortcut.category/basics
+     [:go/search
+      :editor/new-block
+      :editor/new-line
+      :editor/indent
+      :editor/outdent
+      :editor/select-all-blocks
+      :editor/select-parent
+      :go/search-in-page
+      :command-palette/toggle
+      :go/electron-find-in-page
+      :go/electron-jump-to-the-next
+      :go/electron-jump-to-the-previous
+      :editor/undo
+      :editor/redo
+      :editor/copy
+      :editor/copy-text
+      :editor/cut]
 
-   :shortcut.category/navigating
-   ^{:doc "Navigation"}
-   [:editor/up
-    :editor/down
-    :editor/left
-    :editor/right
-    :editor/zoom-in
-    :editor/zoom-out
-    :editor/collapse-block-children
-    :editor/expand-block-children
-    :editor/toggle-open-blocks
-    :go/backward
-    :go/forward]
+     :shortcut.category/formatting
+     [:editor/bold
+      :editor/insert-link
+      :editor/italics
+      :editor/strike-through
+      :editor/highlight]
 
-   :shortcut.category/block-editing
-   ^{:doc "Block editing general"}
-   [:editor/backspace
-    :editor/delete
-    :editor/indent
-    :editor/outdent
-    :editor/new-block
-    :editor/new-line
-    :editor/zoom-in
-    :editor/zoom-out
-    :editor/cycle-todo
-    :editor/follow-link
-    :editor/open-link-in-sidebar
-    :editor/move-block-up
-    :editor/move-block-down
-    :editor/escape-editing]
+     :shortcut.category/navigating
+     [:editor/up
+      :editor/down
+      :editor/left
+      :editor/right
+      :editor/collapse-block-children
+      :editor/expand-block-children
+      :editor/toggle-block-children
+      :editor/toggle-open-blocks
+      :go/backward
+      :go/forward
+      :go/home
+      :go/journals
+      :go/all-pages
+      :go/graph-view
+      :go/all-graphs
+      :go/whiteboards
+      :go/flashcards
+      :go/tomorrow
+      :go/next-journal
+      :go/prev-journal
+      :go/keyboard-shortcuts]
 
-   :shortcut.category/block-command-editing
-   ^{:doc "Block command editing"}
-   [:editor/backspace
-    :editor/clear-block
-    :editor/kill-line-before
-    :editor/kill-line-after
-    :editor/beginning-of-block
-    :editor/end-of-block
-    :editor/forward-word
-    :editor/backward-word
-    :editor/forward-kill-word
-    :editor/backward-kill-word
-    :editor/replace-block-reference-at-point
-    :editor/paste-text-in-one-block-at-point]
+     :shortcut.category/block-editing
+     [:editor/backspace
+      :editor/delete
+      :editor/indent
+      :editor/outdent
+      :editor/new-block
+      :editor/new-line
+      :editor/zoom-in
+      :editor/zoom-out
+      :editor/cycle-todo
+      :editor/follow-link
+      :editor/open-link-in-sidebar
+      :editor/move-block-up
+      :editor/move-block-down
+      :editor/escape-editing]
 
-   :shortcut.category/block-selection
-   ^{:doc "Block selection (press Esc to quit selection)"}
-   [:editor/open-edit
-    :editor/select-all-blocks
-    :editor/select-block-up
-    :editor/select-block-down
-    :editor/delete-selection]
+     :shortcut.category/block-command-editing
+     [:editor/backspace
+      :editor/clear-block
+      :editor/kill-line-before
+      :editor/kill-line-after
+      :editor/beginning-of-block
+      :editor/end-of-block
+      :editor/forward-word
+      :editor/backward-word
+      :editor/forward-kill-word
+      :editor/backward-kill-word
+      :editor/replace-block-reference-at-point
+      :editor/copy-embed
+      :editor/paste-text-in-one-block-at-point
+      :editor/select-up
+      :editor/select-down]
 
-   :shortcut.category/toggle
-   ^{:doc "Toggle"}
-   [:ui/toggle-help
-    :editor/toggle-open-blocks
-    :ui/toggle-wide-mode
-    :ui/toggle-cards
-    :ui/toggle-document-mode
-    :ui/toggle-brackets
-    :ui/toggle-theme
-    :ui/toggle-left-sidebar
-    :ui/toggle-right-sidebar
-    :ui/toggle-settings
-    :ui/toggle-contents]
+     :shortcut.category/block-selection
+     [:editor/open-edit
+      :editor/select-all-blocks
+      :editor/select-parent
+      :editor/select-block-up
+      :editor/select-block-down
+      :editor/delete-selection]
 
-   :shortcut.category/others
-   ^{:doc "Others"}
-   [:go/home
-    :go/journals
-    :go/tomorrow
-    :go/next-journal
-    :go/prev-journal
-    :pdf/previous-page
-    :pdf/next-page
-    :command/run
-    :command-palette/toggle
-    :sidebar/clear
-    :sidebar/open-today-page
-    :search/re-index
-    :editor/insert-youtube-timestamp
-    :auto-complete/prev
-    :auto-complete/next
-    :auto-complete/complete
-    :auto-complete/shift-complete
-    :date-picker/prev-day
-    :date-picker/next-day
-    :date-picker/prev-week
-    :date-picker/next-week
-    :date-picker/complete]})
+     :shortcut.category/toggle
+     [:ui/toggle-help
+      :editor/toggle-open-blocks
+      :editor/toggle-undo-redo-mode
+      :editor/toggle-number-list
+      :ui/toggle-wide-mode
+      :ui/toggle-document-mode
+      :ui/toggle-brackets
+      :ui/toggle-theme
+      :ui/toggle-left-sidebar
+      :ui/toggle-right-sidebar
+      :ui/toggle-settings
+      :ui/toggle-contents
+      :ui/accent-color-reset
+      :ui/accent-colors-picker]
+
+     :shortcut.category/whiteboard
+     [:editor/new-whiteboard
+      :whiteboard/select
+      :whiteboard/pan
+      :whiteboard/portal
+      :whiteboard/pencil
+      :whiteboard/highlighter
+      :whiteboard/eraser
+      :whiteboard/connector
+      :whiteboard/text
+      :whiteboard/rectangle
+      :whiteboard/ellipse
+      :whiteboard/reset-zoom
+      :whiteboard/zoom-to-fit
+      :whiteboard/zoom-to-selection
+      :whiteboard/zoom-out
+      :whiteboard/zoom-in
+      :whiteboard/send-backward
+      :whiteboard/send-to-back
+      :whiteboard/bring-forward
+      :whiteboard/bring-to-front
+      :whiteboard/lock
+      :whiteboard/unlock
+      :whiteboard/group
+      :whiteboard/ungroup
+      :whiteboard/toggle-grid
+      :whiteboard/clone-left
+      :whiteboard/clone-right
+      :whiteboard/clone-top
+      :whiteboard/clone-bottom]
+
+     :shortcut.category/others
+     [:pdf/previous-page
+      :pdf/next-page
+      :pdf/close
+      :pdf/find
+      :command/toggle-favorite
+      :command/run
+      :graph/export-as-html
+      :graph/open
+      :graph/remove
+      :graph/add
+      :graph/save
+      :graph/re-index
+      :sidebar/close-top
+      :sidebar/clear
+      :sidebar/open-today-page
+      :search/re-index
+      :editor/insert-youtube-timestamp
+      :editor/open-file-in-default-app
+      :editor/open-file-in-directory
+      :editor/copy-page-url
+      :window/close
+      :auto-complete/prev
+      :auto-complete/next
+      :auto-complete/complete
+      :auto-complete/shift-complete
+      :auto-complete/open-link
+      :date-picker/prev-day
+      :date-picker/next-day
+      :date-picker/prev-week
+      :date-picker/next-week
+      :date-picker/complete
+      :git/commit
+      :dev/show-block-data
+      :dev/show-block-ast
+      :dev/show-page-data
+      :dev/show-page-ast
+      :ui/clear-all-notifications]
+
+     :shortcut.category/plugins
+     []}))
+
+(let [category-maps {::category       (set (keys @*category))
+                     ::dicts/category dicts/categories}]
+  (assert (= (::category category-maps) (::dicts/category category-maps))
+    (str "Keys for category maps must have an english label "
+      (data/diff (::category category-maps) (::dicts/category category-maps)))))
+
+(defn get-category-shortcuts
+  "Active list of categories for docs purpose"
+  [name]
+  (get @*category name))
+
+(def *shortcut-cmds (atom {}))
 
 (defn add-shortcut!
-  [handler-id id shortcut-map]
-  (swap! config assoc-in [handler-id id] shortcut-map))
+  ([handler-id id shortcut-map] (add-shortcut! handler-id id shortcut-map false))
+  ([handler-id id shortcut-map config-only?]
+   (swap! *config assoc-in [handler-id id] shortcut-map)
+   (when-not config-only?
+     (swap! *shortcut-cmds assoc id (:cmd shortcut-map))
+     (let [plugin? (str/starts-with? (str id) ":plugin.")
+           category (or (:category shortcut-map)
+                      (if plugin?
+                        :shortcut.category/plugins
+                        :shortcut.category/others))]
+       (swap! *category update category #(conj % id))))))
 
 (defn remove-shortcut!
   [handler-id id]
-  (swap! config medley/dissoc-in [handler-id id]))
+  (swap! *config medley/dissoc-in [handler-id id])
+  (swap! *shortcut-cmds dissoc id)
+  (doseq [category (keys @*category)]
+    (swap! *category update category (fn [ids] (remove #(= % id) ids)))))

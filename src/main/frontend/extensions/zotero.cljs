@@ -20,33 +20,33 @@
 (def debounce-chan-mult (a/mult (api/debounce term-chan 500)))
 
 (rum/defc zotero-search-item [{:keys [data] :as item} id]
-  (let [[is-creating-page set-is-creating-page!] (rum/use-state false)]
-    (let [title (:title data)
-          type (:item-type data)
-          abstract (str (subs (:abstract-note data) 0 200) "...")]
+  (let [[is-creating-page set-is-creating-page!] (rum/use-state false)
+        title (:title data)
+        type (:item-type data)
+        abstract (str (subs (:abstract-note data) 0 200) "...")]
+    [:div.zotero-search-item.px-2.py-2.border-b.cursor-pointer.border-solid.last:border-none.relative
+     {:on-click (fn [] (go
+                         (set-is-creating-page! true)
+                         (<!
+                           (zotero-handler/create-zotero-page item {:block-dom-id id}))
+                         (set-is-creating-page! false)))}
+     [[:div [[:span.font-medium.mb-1.mr-1.text-sm title]
+             [:span.zotero-search-item-type.text-xs.p-1.rounded type]]]
+      [:div.text-sm.opacity-60 abstract]]
 
-      [:div.zotero-search-item.px-2.py-4.border-b.cursor-pointer.border-solid.last:border-none.relative
-       {:on-click (fn [] (go
-                           (set-is-creating-page! true)
-                           (<!
-                            (zotero-handler/create-zotero-page item {:block-dom-id id}))
-                           (set-is-creating-page! false)))}
-       [[:div [[:span.font-bold.mb-1.mr-1 title]
-               [:span.zotero-search-item-type.text-xs.p-1.rounded type]]]
-        [:div.text-sm abstract]]
-
-       (when is-creating-page [:div.zotero-search-item-loading-indicator [:span.animate-spin-reverse  svg/refresh]])])))
+     (when is-creating-page
+       [:div.zotero-search-item-loading-indicator [:span.animate-spin-reverse (svg/refresh)]])]))
 
 (rum/defc zotero-search
   [id]
 
-  (let [[term set-term!]                         (rum/use-state "")
-        [search-result set-search-result!]       (rum/use-state [])
-        [prev-page set-prev-page!]               (rum/use-state "")
-        [next-page set-next-page!]               (rum/use-state "")
+  (let [[term set-term!] (rum/use-state "")
+        [search-result set-search-result!] (rum/use-state [])
+        [prev-page set-prev-page!] (rum/use-state "")
+        [next-page set-next-page!] (rum/use-state "")
         [prev-search-term set-prev-search-term!] (rum/use-state "")
-        [search-error set-search-error!]         (rum/use-state nil)
-        [is-searching set-is-searching!]         (rum/use-state false)
+        [search-error set-search-error!] (rum/use-state nil)
+        [is-searching set-is-searching!] (rum/use-state false)
 
         search-fn (fn [s-term start]
                     (go
@@ -67,55 +67,59 @@
                         (set-is-searching! false))))]
 
     (rum/use-effect!
-     (fn []
-       (let [d-chan (chan)]
-         (a/tap debounce-chan-mult d-chan)
-         (go-loop []
-           (let [d-term (<! d-chan)]
-             (<! (search-fn d-term "0")))
-           (recur))
+      (fn []
+        (let [d-chan (chan)]
+          (a/tap debounce-chan-mult d-chan)
+          (go-loop []
+                   (let [d-term (<! d-chan)]
+                     (<! (search-fn d-term "0")))
+                   (recur))
 
-         (fn [] (a/untap debounce-chan-mult d-chan))))
-     [])
+          (fn [] (a/untap debounce-chan-mult d-chan))))
+      [])
 
     (when-not (setting/valid?)
       (route-handler/redirect! {:to :zotero-setting})
       (notification/show! "Please setup Zotero API key and user/group id first!" :warn false))
 
-    [:div#zotero-search.zotero-search.p-4
-     {:style {:width 600}}
+    [:div#zotero-search.zotero-search
+     [:div.flex.items-center.input-wrap
+      [:input.flex-1.focus:outline-none
+       {:autoFocus   true
+        :placeholder "Search for your Zotero articles (title, author, text, anything)"
+        :value       term
+        :on-change   (fn [e]
+                       (go
+                         (>! term-chan (util/evalue e)))
+                       (set-term! (util/evalue e)))}]
 
-     [:div.flex.items-center.mb-2
-      [[:input.p-2.border.mr-2.flex-1.focus:outline-none
-        {:autoFocus   true
-         :placeholder "Search for your Zotero journal article (title, author, text, anything)"
-         :value       term :on-change (fn [e]
-                                        (go
-                                          (>! term-chan (util/evalue e)))
-                                        (set-term! (util/evalue e)))}]
+      (when is-searching (ui/loading ""))]
 
-       [:span.animate-spin-reverse {:style {:visibility (if is-searching "visible"  "hidden")}}  svg/refresh]]]
+     (when search-error
+       [:div.h-2.text-sm.text-error.mb-2
+        (str "Search error: " search-error "")])
 
-     [:div.h-2.text-sm.text-red-400.mb-2 (if search-error (str "Search error: " search-error) "")]
+     (when (seq search-result)
+       [:div.p-2
+        (map
+          (fn [item] (rum/with-key (zotero-search-item item id) (:key item)))
+          search-result)
 
-     [:div
-      (map
-       (fn [item] (rum/with-key (zotero-search-item item id) (:key item)))
-       search-result)
-      (when-not (str/blank? prev-page)
-        (ui/button
-         "prev"
-         :on-click
-         (fn []
-           (set! (.-scrollTop (.-parentNode (gdom/getElement "zotero-search"))) 0)
-           (go (<! (search-fn prev-search-term prev-page))))))
-      (when-not (str/blank? next-page)
-        (ui/button
-         "next"
-         :on-click
-         (fn []
-           (set! (.-scrollTop (.-parentNode (gdom/getElement "zotero-search"))) 0)
-           (go (<! (search-fn prev-search-term next-page))))))]]))
+        ;; pagination
+        (when-not (str/blank? prev-page)
+          (ui/button
+            "prev"
+            :on-click
+            (fn []
+              (set! (.-scrollTop (.-parentNode (gdom/getElement "zotero-search"))) 0)
+              (search-fn prev-search-term prev-page))))
+        (when-not (str/blank? next-page)
+          (ui/button
+            "next"
+            :on-click
+            (fn []
+              (set! (.-scrollTop (.-parentNode (gdom/getElement "zotero-search"))) 0)
+              (search-fn prev-search-term next-page))))])]))
 
 (rum/defcs user-or-group-setting <
   (rum/local (setting/setting :type-id) ::type-id)
@@ -123,7 +127,7 @@
   [state]
   [:div
    [:div.row
-    [:label.title
+    [:label.title.w-72
      {:for "zotero_type"}
      "Zotero user or group?"]
     [:div.mt-1.sm:mt-0.sm:col-span-2
@@ -139,7 +143,7 @@
          [:option {:key type :value type} (str/capitalize type)])]]]]
 
    [:div.row
-    [:label.title
+    [:label.title.w-72
      {:for "zotero_type_id"}
      "User or Group ID"]
     [:div.mt-1.sm:mt-0.sm:col-span-2
@@ -151,22 +155,22 @@
         :on-change     (fn [e] (reset! (::type-id state) (util/evalue e)))}]]]]
 
    (when
-    (and (not (str/blank? (str @(::type-id state))))
-         (not (re-matches #"^\d+$" (str @(::type-id state)))))
+     (and (not (str/blank? (str @(::type-id state))))
+          (not (re-matches #"^\d+$" (str @(::type-id state)))))
      (ui/admonition
-      :warning
-      [:p.text-red-500
-       "User ID is different from username and can be found on the "
-       [:a {:href "https://www.zotero.org/settings/keys" :target "_blank"}
-        "https://www.zotero.org/settings/keys"]
-       " page, it's a number of digits"]))])
+       :warning
+       [:p.text-error
+        "User ID is different from username and can be found on the "
+        [:a {:href "https://www.zotero.org/settings/keys" :target "_blank"}
+         "https://www.zotero.org/settings/keys"]
+        " page, it's a number of digits"]))])
 
 (rum/defc overwrite-mode-setting <
   rum/reactive
   []
   [:div
    [:div.row
-    [:label.title
+    [:label.title.w-72
      {:for "zotero_overwrite_mode"}
      "Overwrite existing item page?"]
     [:div
@@ -176,16 +180,16 @@
                  true)]]]
    (when (setting/setting :overwrite-mode?)
      (ui/admonition
-      :warning
-      [:p.text-red-500
-       "Dangerous! This will delete and recreate Zotero existing page! Make sure to backup your notes first in case something goes wrong. Make sure you don't put any personal item in previous Zotero page and it's OK to overwrite the page!"]))])
+       :warning
+       [:p.text-error
+        "Dangerous! This will delete and recreate Zotero existing page! Make sure to backup your notes first in case something goes wrong. Make sure you don't put any personal item in previous Zotero page and it's OK to overwrite the page!"]))])
 
 (rum/defc attachment-setting <
   rum/reactive
   []
   [:div
    [:div.row
-    [:label.title
+    [:label.title.w-72
      {:for "zotero_include_attachment_links"}
      "Include attachment links?"]
     [:div
@@ -195,7 +199,7 @@
                  true)]]]
    (when (setting/setting :include-attachments?)
      [:div.row
-      [:label.title
+      [:label.title.w-72
        {:for "zotero_attachments_block_text"}
        "Attachment under block of:"]
       [:div.mt-1.sm:mt-0.sm:col-span-2
@@ -205,7 +209,7 @@
           :on-blur       (fn [e] (setting/set-setting! :attachments-block-text (util/evalue e)))}]]]])
    (when (setting/setting :include-attachments?)
      [:div.row
-      [:label.title
+      [:label.title.w-72
        {:for "zotero_linked_attachment_base_directory"}
        "Zotero linked attachment base directory"
        [:a.ml-2
@@ -224,10 +228,10 @@
   rum/reactive
   []
   [:div.row
-   [:label.title
+   [:label.title.w-72
     {:for   "zotero_prefer_citekey"
      :title "Make sure to install Better BibTeX and pin your item first"}
-    "Always prefer citekey as your page title?"]
+    "Use citekey as your page title?"]
    [:div
     [:div.rounded-md.sm:max-w-xs
      (ui/toggle (setting/setting :prefer-citekey?)
@@ -236,7 +240,7 @@
 
 (rum/defc api-key-setting []
   [:div.row
-   [:label.title
+   [:label.title.w-72
     {:for "zotero_api_key"}
     "Zotero API key"]
    [:div.mt-1.sm:mt-0.sm:col-span-2
@@ -251,7 +255,7 @@
   []
   [:div
    [:div.row
-    [:label.title
+    [:label.title.w-72
      {:for "zotero_include_notes"}
      "Include notes?"]
     [:div
@@ -285,7 +289,7 @@
 (rum/defc extra-tags-setting []
   [:div.row
    [:label.title
-    {:for "zotero_extra_tags"
+    {:for   "zotero_extra_tags"
      :title "Extra tags to add for every imported page. Separate by comma, or leave it empty."}
     "Extra tags to add:"]
    [:div.mt-1.sm:mt-0.sm:col-span-2
@@ -301,8 +305,8 @@
     {:for "zotero_data_directory"}
     "Zotero data directory"
     [:a.ml-2
-     {:title "Set Zotero data directory to open pdf attachment in Logseq. Click to learn more."
-      :href "https://www.zotero.org/support/zotero_data"
+     {:title  "Set Zotero data directory to open pdf attachment in Logseq. Click to learn more."
+      :href   "https://www.zotero.org/support/zotero_data"
       :target "_blank"}
      (svg/info)]]
    [:div.mt-1.sm:mt-0.sm:col-span-2
@@ -323,14 +327,14 @@
         "Please enter your profile name"]]]
 
      [:input.form-input.block.w-full.sm:text-sm.sm:leading-5.my-2
-      {:auto-focus true
+      {:auto-focus    true
        :default-value ""
-       :on-change (fn [e] (reset! input (util/evalue e)))}]
+       :on-change     (fn [e] (reset! input (util/evalue e)))}]
 
      [:div.mt-5.sm:mt-4.sm:flex.sm:flex-row-reverse
       [:span.flex.w-full.rounded-md.shadow-sm.sm:ml-3.sm:w-auto
-       [:button.inline-flex.justify-center.w-full.rounded-md.border.border-transparent.px-4.py-2.bg-indigo-600.text-base.leading-6.font-medium.text-white.shadow-sm.hover:bg-indigo-500.focus:outline-none.focus:border-indigo-700.focus:shadow-outline-indigo.transition.ease-in-out.duration-150.sm:text-sm.sm:leading-5
-        {:type "button"
+       (ui/button
+         "Submit"
          :class "ui__modal-enter"
          :on-click (fn []
                      (let [profile-name (str/trim @input)]
@@ -338,48 +342,46 @@
                          (p/let [_ (setting/add-profile profile-name)
                                  _ (setting/set-profile profile-name)]
                            (reset! profile* profile-name)))
-                       (state/close-modal!)))}
-        "Submit"]]
-      [:span.mt-3.flex.w-full.rounded-md.shadow-sm.sm:mt-0.sm:w-auto
-       [:button.inline-flex.justify-center.w-full.rounded-md.border.border-gray-300.px-4.py-2.bg-white.text-base.leading-6.font-medium.text-gray-700.shadow-sm.hover:text-gray-500.focus:outline-none.focus:border-blue-300.focus:shadow-outline-blue.transition.ease-in-out.duration-150.sm:text-sm.sm:leading-5
-        {:type "button"
-         :on-click close-fn}
-        "Cancel"]]]]))
+                       (state/close-modal!))))]
+      [:span.mt-3.flex.w-full.rounded-md.sm:mt-0.sm:w-auto
+       (ui/button "Cancel" {:variant :ghost :on-click close-fn :class "opacity-70 hover:opacity-100"})]]]))
 
 (rum/defc zotero-profile-selector <
   rum/reactive
   [profile*]
-  [:div.zotero-profile-selector.my-4
-   [:label.mr-32 {:for "profile-select"} "Choose a profile:"]
-   [:select
-    {:value @profile*
-     :on-change
-     (fn [e]
-       (when-let [profile (util/evalue e)]
-         (p/let [_ (setting/set-profile profile)]
-           (reset! profile* profile))))}
-    (map-indexed (fn [i x] [:option
-                            {:key      i
-                             :value    x}
-                            x]) (setting/all-profiles))]
-   (ui/button
-    "New profile"
-    :small? true
-    :class "ml-4"
-    :on-click
-    (fn []
-      (state/set-modal!
-        (fn [close-fn]
-          (profile-name-dialog-inner profile* close-fn)))))
-   (ui/button
-    "Delete profile!"
-    :small? true
-    :background "red"
-    :class "ml-4"
-    :on-click
-    (fn []
-      (p/let [_ (setting/remove-profile @profile*)]
-        (reset! profile* (setting/profile)))))])
+  [:div.flex.flex-row.mb-4.items-center
+   [:label.title.mr-32 {:for "profile-select"} "Choose a profile:"]
+   [:div.flex.flex-row.ml-4
+    [:select.ml-1.rounded
+     {:style {:padding "0px 36px 0px 8px"}
+      :value @profile*
+      :on-change
+      (fn [e]
+        (when-let [profile (util/evalue e)]
+          (p/let [_ (setting/set-profile profile)]
+            (reset! profile* profile))))}
+     (map-indexed (fn [i x] [:option
+                             {:key   i
+                              :value x}
+                             x]) (setting/all-profiles))]
+    (ui/button
+      "New profile"
+      :small? true
+      :class "ml-4"
+      :on-click
+      (fn []
+        (state/set-modal!
+          (fn [close-fn]
+            (profile-name-dialog-inner profile* close-fn)))))
+    (ui/button
+      "Delete profile!"
+      :small? true
+      :background "red"
+      :class "ml-4"
+      :on-click
+      (fn []
+        (p/let [_ (setting/remove-profile @profile*)]
+          (reset! profile* (setting/profile)))))]])
 
 (rum/defcs add-all-items <
   (rum/local nil ::progress)
@@ -389,29 +391,29 @@
   [state]
   [:div
    [:div.row
-    [:label.title
+    [:label.title.w-72
      {:for "zotero_import_all"}
      "Add all zotero items"]
     [:div.mt-1.sm:mt-0.sm:col-span-2
      (ui/button
-      @(::fetching-button state)
-      :on-click
-      (fn []
-        (go
-          (let [_     (reset! (::fetching-button state) "Fetching..")
-                total (<! (api/all-top-items-count))
-                _     (reset! (::fetching-button state) "Add all")]
-            (when (.confirm
-                   js/window
-                   (str "This will import all your zotero items and add total number of " total " pages. Do you wish to continue?"))
+       @(::fetching-button state)
+       :on-click
+       (fn []
+         (go
+           (let [_ (reset! (::fetching-button state) "Fetching..")
+                 total (<! (api/all-top-items-count))
+                 _ (reset! (::fetching-button state) "Add all")]
+             (when (.confirm
+                     js/window
+                     (str "This will import all your zotero items and add total number of " total " pages. Do you wish to continue?"))
 
-              (reset! (::total state) total)
-              (<! (zotero-handler/add-all (::progress state)))
-              (reset! (::total state) false)
-              (notification/show! "Successfully added all items!" :success))))))]]
+               (reset! (::total state) total)
+               (<! (zotero-handler/add-all (::progress state)))
+               (reset! (::total state) false)
+               (notification/show! "Successfully added all items!" :success))))))]]
    (ui/admonition
-    :warning
-    "If you have a lot of items in Zotero, adding them all can slow down Logseq. You can type /zotero to import specific item on demand instead.")
+     :warning
+     "If you have a lot of items in Zotero, adding them all can slow down Logseq. You can type /zotero to import specific item on demand instead.")
 
    (when @(::total state)
      [:div.row
@@ -445,7 +447,7 @@
   (rum/local (setting/profile) ::profile)
   rum/reactive
   {:should-update
-   (fn [old-state new-state]
+   (fn [old-state _new-state]
      (let [all-profiles (setting/all-profiles)]
        (not= all-profiles @(::all-profiles old-state))))}
   [state]
@@ -461,18 +463,18 @@
 (defn open-button [full-path]
   (if (str/ends-with? (str/lower-case full-path) "pdf")
     (ui/button
-     "open"
-     :small? true
-     :on-click
-     (fn [e]
-       (when-let [current (pdf-assets/inflate-asset full-path)]
-         (util/stop e)
-         (state/set-state! :pdf/current current))))
+      "open"
+      :small? true
+      :on-click
+      (fn [e]
+        (when-let [current (pdf-assets/inflate-asset full-path)]
+          (util/stop e)
+          (state/set-state! :pdf/current current))))
     (ui/button
-     "open"
-     :small? true
-     :target "_blank"
-     :href full-path)))
+      "open"
+      :small? true
+      :target "_blank"
+      :href full-path)))
 
 (rum/defc zotero-imported-file
   [item-key filename]
@@ -482,10 +484,10 @@
           full-path
           (str "file://"
                (util/node-path.join
-                (setting/setting :zotero-data-directory)
-                "storage"
-                item-key
-                filename))]
+                 (setting/setting :zotero-data-directory)
+                 "storage"
+                 item-key
+                 filename))]
       (open-button full-path))))
 
 (rum/defc zotero-linked-file
@@ -496,6 +498,6 @@
           full-path
           (str "file://"
                (util/node-path.join
-                (setting/setting :zotero-linked-attachment-base-directory)
-                (str/replace-first path "attachments:" "")))]
+                 (setting/setting :zotero-linked-attachment-base-directory)
+                 (str/replace-first path "attachments:" "")))]
       (open-button full-path))))

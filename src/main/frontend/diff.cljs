@@ -1,35 +1,17 @@
-(ns frontend.diff
+(ns ^:no-doc frontend.diff
   (:require [clojure.string :as string]
             ["diff" :as jsdiff]
-            ["diff-match-patch" :as diff-match-patch]
             [goog.object :as gobj]
             [lambdaisland.glogi :as log]
             [cljs-bean.core :as bean]
             [frontend.util :as util]
-            [frontend.text :as text]))
+            [logseq.graph-parser.util :as gp-util]
+            [frontend.util.text :as text-util]))
 
-;; TODO: replace with diff-match-patch
 (defn diff
   [s1 s2]
-  (-> ((gobj/get jsdiff "diffLines") s1 s2)
+  (-> ((gobj/get jsdiff "diffLines") s1 s2 (clj->js {"newlineIsToken" true}))
       bean/->clj))
-
-(defonce dmp (diff-match-patch.))
-
-(defn diffs
-  [s1 s2]
-  (.diff_main dmp s1 s2 true))
-
-(defn get-patches
-  [s1 s2 diffs]
-  (.patch_make dmp s1 s2 diffs))
-
-(defn apply-patches!
-  [text patches]
-  (if (seq patches)
-    (let [result (.patch_apply dmp patches text)]
-      (nth result 0))
-    text))
 
 (def inline-special-chars
   #{\* \_ \/ \` \+ \^ \~ \$})
@@ -65,15 +47,15 @@
 
                       :else
                       (recur r1 t2 (inc i1) i2))))
-            current-line (text/get-current-line-by-pos markup pos)]
+            current-line (:line (text-util/get-current-line-by-pos markup pos))]
         (cond
-          (and (= (util/nth-safe markup pos)
-                  (util/nth-safe markup (inc pos))
-                  "]"))
+          (= (util/nth-safe markup pos)
+             (util/nth-safe markup (inc pos))
+             "]")
           (+ pos 2)
 
           (contains? inline-special-chars (util/nth-safe markup pos))
-          (let [matched (->> (take-while inline-special-chars (util/safe-subs markup pos))
+          (let [matched (->> (take-while inline-special-chars (gp-util/safe-subs markup pos))
                              (apply str))
                 matched? (and current-line (string/includes? current-line (string/reverse matched)))]
             (if matched?
@@ -86,6 +68,6 @@
 
           :else
           pos))
-      (catch js/Error e
+      (catch :default e
         (log/error :diff/find-position {:error e})
         (count markup)))))

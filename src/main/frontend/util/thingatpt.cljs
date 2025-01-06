@@ -1,10 +1,13 @@
-(ns frontend.util.thingatpt
+(ns ^:no-doc frontend.util.thingatpt
   (:require [clojure.string :as string]
             [frontend.state :as state]
-            [frontend.util.property :as property-util]
             [frontend.util.cursor :as cursor]
             [frontend.config :as config]
-            [frontend.text :as text]
+            [logseq.graph-parser.text :as text]
+            [logseq.graph-parser.property :as gp-property]
+            [logseq.graph-parser.util.block-ref :as block-ref]
+            [logseq.graph-parser.util.page-ref :as page-ref]
+            [cljs.reader :as reader]
             [goog.object :as gobj]))
 
 (defn thing-at-point
@@ -45,69 +48,74 @@
          :end line-end-pos}))))
 
 (defn block-ref-at-point [& [input]]
-  (when-let [block-ref (thing-at-point ["((" "))"] input " ")]
+  (when-let [block-ref (thing-at-point [block-ref/left-parens block-ref/right-parens] input " ")]
     (when-let [uuid (uuid (:raw-content block-ref))]
       (assoc block-ref
              :type "block-ref"
              :link uuid))))
 
 (defn page-ref-at-point [& [input]]
-  (when-let [page-ref (thing-at-point ["[[" "]]"] input)]
+  (when-let [page-ref (thing-at-point [page-ref/left-brackets page-ref/right-brackets] input)]
     (assoc page-ref
            :type "page-ref"
            :link (text/get-page-name
                   (:full-content page-ref)))))
 
 (defn embed-macro-at-point [& [input]]
-  (when-let [macro (thing-at-point ["{{embed" "}}"] (first input) " ")]
+  (when-let [macro (thing-at-point ["{{embed" "}}"] input)]
     (assoc macro :type "macro")))
 
+;; TODO support markdown YAML front matter
+;; TODO support using org style properties in markdown
 (defn properties-at-point [& [input]]
   (when-let [properties
-             (case (state/get-preferred-format)
+             (case (state/get-preferred-format) ;; TODO fix me to block's format
                :org (thing-at-point
-                     [property-util/properties-start
-                      property-util/properties-end]
+                     [gp-property/properties-start
+                      gp-property/properties-end]
                      input)
                (when-let [line (line-at-point input)]
                  (when (re-matches #"^[^\s.]+:: .*$" (:raw-content line))
                    line)))]
     (assoc properties :type "properties-drawer")))
 
+;; TODO support markdown YAML front matter
+;; TODO support using org style properties in markdown
 (defn property-key-at-point [& [input]]
   (when (properties-at-point input)
     (let [property
-          (case (state/get-preferred-format)
+          (case (state/get-preferred-format) ;; TODO fix me to block's format
             :org (thing-at-point ":" input "\n")
             (when-let [line (:raw-content (line-at-point input))]
-              (let [key (first (string/split line "::"))
+              (let [key (first (string/split line gp-property/colons))
                     line-beginning-pos (cursor/line-beginning-pos input)
                     pos-in-line (- (cursor/pos input) line-beginning-pos)]
-                (if (<= 0 pos-in-line (+ (count key) (count "::")))
-                  {:full-content (str key "::")
+                (when (<= 0 pos-in-line (+ (count key) (count gp-property/colons)))
+                  {:full-content (str key gp-property/colons)
                    :raw-content key
                    :start line-beginning-pos
-                   :end (+ line-beginning-pos (count (str key "::")))}))))]
+                   :end (+ line-beginning-pos (count (str key gp-property/colons)))}))))]
       (assoc property :type "property-key"))))
 
-(defn- get-list-item-indent&bullet [line]
+(defn get-list-item-indent&bullet [line]
   (when-not (string/blank? line)
-    (or (re-matches #"^([ \t\r]*)(\+|\*|-) (\[[X ]\])*.*$" line)
-        (re-matches #"^([\s]*)(\d+)\. (\[[X ]\])*.*$" line))))
+    (or (re-matches #"^([ \t\r]*)(\+|\*|-){1} (\[[X ]\])?.*$" line)
+        (re-matches #"^([\s]*)(\d+){1}\. (\[[X ]\])?.*$" line))))
 
 (defn list-item-at-point [& [input]]
   (when-let [line (line-at-point input)]
     (when-let [[_ indent bullet checkbox]
                (get-list-item-indent&bullet (:raw-content line))]
-      (assoc line
-             :type "list-item"
-             :indent indent
-             :bullet bullet
-             :checkbox checkbox
-             :ordered (int? (cljs.reader/read-string bullet))))))
+      (let [bullet (reader/read-string bullet)]
+        (assoc line
+               :type "list-item"
+               :indent indent
+               :bullet bullet
+               :checkbox checkbox
+               :ordered (int? bullet))))))
 
 (defn- get-markup-at-point [& [input]]
-  (let [format (state/get-preferred-format)]
+  (let [format (state/get-preferred-format)] ;; TODO fix me to block's format
    (or (thing-at-point (config/get-hr format) input)
        (thing-at-point (config/get-bold format) input)
        (thing-at-point (config/get-italic format) input)
@@ -120,7 +128,7 @@
   (when-let [markup (get-markup-at-point input)]
     (assoc markup :type "markup")))
 
-(defn- org-admonition&src-at-point [& [input]]
+(defn org-admonition&src-at-point [& [input]]
   (when-let [admonition&src (thing-at-point ["#+BEGIN_" "#+END_"] input)]
     (let [params (string/split
                   (first (string/split-lines (:full-content admonition&src)))
@@ -141,18 +149,23 @@
                      :name name
                      :end (+ (:end admonition&src) (count name))))))))
 
-(defn- markdown-src-at-point [& [input]]
+(defn markdown-src-at-point [& [input]]
   (when-let [markdown-src (thing-at-point ["```" "```"] input)]
     (let [language (-> (:full-content markdown-src)
                        string/split-lines
                        first
                        (string/replace "```" "")
-                       string/trim)]
-      (when-not (string/blank? language)
-            (assoc markdown-src
-                   :type "source-block"
-                   :language language
-                   :headers nil)))))
+                       string/trim)
+          raw-content (:raw-content markdown-src)
+          blank-raw-content? (string/blank? raw-content)
+          action (if (or blank-raw-content? (= (string/trim raw-content) language))
+                   :into-code-editor
+                   :none)]
+      (assoc markdown-src
+             :type "source-block"
+             :language language
+             :action action
+             :headers nil))))
 
 (defn admonition&src-at-point [& [input]]
   (or (org-admonition&src-at-point input)
@@ -164,7 +177,7 @@
    :block-ref?       true
    :page-ref?        true
    :properties?      true
-   :list?            true})
+   :list?            false})
 
 (defn get-setting [setting]
   (let [value (get-in (state/get-config) [:dwim/settings setting])]
